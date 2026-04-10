@@ -20,6 +20,189 @@
 - 百炼向量模型：`text-embedding-v4`
 - 可选重排模型：`qwen3-rerank`
 
+## 环境准备
+
+本文档描述的是原生环境部署方式，不依赖 Docker。
+
+下面的步骤以“你已经进入仓库根目录”为前提，也就是当前目录为：
+
+```text
+rag-kb/
+```
+
+如果你还没进入仓库目录，先执行：
+
+macOS / Linux：
+
+```bash
+cd /path/to/rag-kb
+```
+
+Windows PowerShell / CMD：
+
+```powershell
+cd C:\path\to\rag-kb
+```
+
+仓库里的实际 skill 文件位于：
+
+```text
+src/bailian_faiss_kb/
+```
+
+### macOS
+
+1. 安装 Python `3.10+`
+
+如果你使用 Homebrew：
+
+```bash
+brew install python@3.12
+python3 --version
+```
+
+2. 创建虚拟环境
+
+以下 2、3、4 步都在仓库根目录 `rag-kb/` 下执行。
+
+```bash
+python3 -m venv .venv
+```
+
+3. 激活虚拟环境
+
+```bash
+source .venv/bin/activate
+```
+
+如果你就是在当前仓库 `/Users/ningwei/VSCodeProjects/rag-kb` 下操作，也可以直接用：
+
+```bash
+source /Users/ningwei/VSCodeProjects/rag-kb/.venv/bin/activate
+```
+
+4. 安装依赖
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r src/bailian_faiss_kb/requirements.txt
+```
+
+5. 验证脚本可用
+
+```bash
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /tmp/openclaw-kb doctor
+```
+
+### Linux
+
+1. 安装 Python `3.10+`
+
+Ubuntu / Debian 示例：
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip
+python3 --version
+```
+
+2. 创建虚拟环境
+
+以下 2、3、4 步都在仓库根目录 `rag-kb/` 下执行。
+
+```bash
+python3 -m venv .venv
+```
+
+3. 激活虚拟环境
+
+```bash
+source .venv/bin/activate
+```
+
+4. 安装依赖
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r src/bailian_faiss_kb/requirements.txt
+```
+
+5. 验证脚本可用
+
+```bash
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /tmp/openclaw-kb doctor
+```
+
+### Windows
+
+1. 安装 Python `3.10+`
+
+如果你使用 `winget`：
+
+```powershell
+winget install Python.Python.3.12
+py -3 --version
+```
+
+安装时建议勾选 “Add Python to PATH”。
+
+2. 创建虚拟环境
+
+以下 2、3、4 步都在仓库根目录 `rag-kb/` 下执行。
+
+PowerShell：
+
+```powershell
+py -3 -m venv .venv
+```
+
+CMD：
+
+```bat
+py -3 -m venv .venv
+```
+
+3. 激活虚拟环境
+
+PowerShell：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+CMD：
+
+```bat
+.\.venv\Scripts\activate.bat
+```
+
+4. 安装依赖
+
+PowerShell / CMD：
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r src\bailian_faiss_kb\requirements.txt
+```
+
+5. 验证脚本可用
+
+```powershell
+python .\src\bailian_faiss_kb\scripts\bailian_faiss_kb.py --root-dir C:\temp\openclaw-kb doctor
+```
+
+### 验证通过的判断标准
+
+执行 `doctor` 后会输出一段 JSON，至少应看到这些字段：
+
+- `python_compatible: true`
+- `requests: true`
+- `numpy: true`
+- `faiss: true`
+- `markitdown: true`
+
+如果这些字段都正常，这个 skill 的 Python 脚本已经可以使用。
+
 ## 环境变量
 
 推荐使用：
@@ -34,10 +217,26 @@ export BAILIAN_SK="你的百炼 API Key"
 export BAILIAN-SK="你的百炼 API Key"
 ```
 
-## 安装依赖
+Windows 下可按当前 shell 设置：
+
+PowerShell：
+
+```powershell
+$env:BAILIAN_SK = "你的百炼 API Key"
+```
+
+CMD：
+
+```bat
+set BAILIAN_SK=你的百炼 API Key
+```
+
+## 快速开始
 
 ```bash
-python3 -m pip install -r requirements.txt
+source .venv/bin/activate
+python -m pip install -r src/bailian_faiss_kb/requirements.txt
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /tmp/openclaw-kb doctor
 ```
 
 ## 目录结构
@@ -62,17 +261,16 @@ python3 -m pip install -r requirements.txt
 
 详细规则见：
 
-- `references/layout.md`
-- `references/content-rules.md`
-- `references/runtime-notes.md`
+- `src/bailian_faiss_kb/references/layout.md`
+- `src/bailian_faiss_kb/references/content-rules.md`
+- `src/bailian_faiss_kb/references/runtime-notes.md`
 
 ## 常用命令
 
 将文件转换为 Markdown：
 
 ```bash
-python3 scripts/bailian_faiss_kb.py convert \
-  --root-dir /var/openclaw-kb \
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb convert \
   --input /var/openclaw-kb/regulation/202604111230-demo/demo.docx \
   --output /var/openclaw-kb/regulation/202604111230-demo/demo.md
 ```
@@ -80,8 +278,7 @@ python3 scripts/bailian_faiss_kb.py convert \
 为单个文档目录建立索引：
 
 ```bash
-python3 scripts/bailian_faiss_kb.py index \
-  --root-dir /var/openclaw-kb \
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb index \
   --kb regulation \
   --doc-dir /var/openclaw-kb/regulation/202604111230-demo
 ```
@@ -89,8 +286,7 @@ python3 scripts/bailian_faiss_kb.py index \
 查询单个知识库：
 
 ```bash
-python3 scripts/bailian_faiss_kb.py query \
-  --root-dir /var/openclaw-kb \
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb query \
   --kb regulation \
   --query "报销审批流程是什么"
 ```
@@ -98,16 +294,14 @@ python3 scripts/bailian_faiss_kb.py query \
 查询全部知识库：
 
 ```bash
-python3 scripts/bailian_faiss_kb.py query \
-  --root-dir /var/openclaw-kb \
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb query \
   --query "报销审批流程是什么"
 ```
 
 启用重排查询：
 
 ```bash
-python3 scripts/bailian_faiss_kb.py query \
-  --root-dir /var/openclaw-kb \
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb query \
   --kb regulation \
   --query "报销审批流程是什么" \
   --rerank
@@ -116,8 +310,7 @@ python3 scripts/bailian_faiss_kb.py query \
 检查运行环境：
 
 ```bash
-python3 scripts/bailian_faiss_kb.py doctor \
-  --root-dir /var/openclaw-kb
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb doctor
 ```
 
 ## 安全说明
