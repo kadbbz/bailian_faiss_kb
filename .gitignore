@@ -1,0 +1,10 @@
+.env
+.env.*
+.pycache/
+.rag-kb/
+
+.venv/
+
+kbroot/
+clawhub/
+testdata/
