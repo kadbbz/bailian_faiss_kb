@@ -6,5 +6,6 @@
 .venv/
 
 kbroot/
-clawhub/
 testdata/
+dist/
+.DS_Storeß
