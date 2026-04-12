@@ -28,26 +28,6 @@ RRF_K = 60
 TOKENIZER_NAME = "jieba_v1"
 RETRIEVAL_MODES = {"semantic", "keyword", "hybrid"}
 PROTECTED_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._:/-][A-Za-z0-9]+)*")
-SUPPORTED_EXTENSIONS = {
-    ".csv",
-    ".doc",
-    ".docx",
-    ".htm",
-    ".html",
-    ".json",
-    ".markdown",
-    ".md",
-    ".pdf",
-    ".ppt",
-    ".pptx",
-    ".rst",
-    ".txt",
-    ".xls",
-    ".xlsx",
-    ".xml",
-    ".yaml",
-    ".yml",
-}
 
 
 class KBError(RuntimeError):
@@ -76,14 +56,6 @@ def load_faiss():
     except ImportError as exc:
         raise KBError("Missing dependency 'faiss-cpu'. Run: python3 -m pip install -r requirements.txt") from exc
     return faiss
-
-
-def load_markitdown():
-    try:
-        from markitdown import MarkItDown
-    except ImportError as exc:
-        raise KBError("Missing dependency 'markitdown'. Run: python3 -m pip install -r requirements.txt") from exc
-    return MarkItDown
 
 
 def load_jieba():
@@ -167,13 +139,6 @@ def sanitize_component(name: str) -> str:
     return cleaned or "file"
 
 
-def trim_text(text: str, limit: int) -> str:
-    text = normalize_text(text)
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
-
-
 def load_api_key() -> str:
     api_key = os.getenv("BAILIAN-SK") or os.getenv("BAILIAN_SK")
     if not api_key:
@@ -250,24 +215,6 @@ def ensure_kb_config(
     return config
 
 
-def convert_source(input_path: Path) -> str:
-    suffix = input_path.suffix.lower()
-    if suffix in {".md", ".markdown", ".rst", ".txt"}:
-        return normalize_text(input_path.read_text(encoding="utf-8", errors="ignore"))
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise KBError(f"Unsupported file extension: {suffix}")
-    MarkItDown = load_markitdown()
-    converter = MarkItDown()
-    result = converter.convert(str(input_path))
-    text = getattr(result, "text_content", "") or getattr(result, "markdown", "") or str(result)
-    return normalize_text(text)
-
-
-def write_markdown_output(output_path: Path, markdown: str) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(markdown + "\n", encoding="utf-8")
-
-
 def validate_doc_dir(doc_dir: Path, kb_root: Path, kb_name: str) -> Path:
     expected_parent = kb_dir(kb_root, kb_name)
     doc_dir = doc_dir.resolve()
@@ -283,21 +230,22 @@ def parse_doc_dir_name(doc_dir: Path) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
-def find_primary_source_file(doc_dir: Path) -> Path:
-    for entry in sorted(doc_dir.iterdir(), key=lambda item: item.name):
-        if entry.is_file() and entry.suffix.lower() != ".md" and entry.name != "summary.txt":
-            return entry
-    raise KBError(f"No source file found in {doc_dir}")
-
-
-def find_doc_markdown(doc_dir: Path, safe_name: str, raw_file: Path) -> Path:
-    preferred = doc_dir / f"{safe_name}.md"
-    if preferred.exists():
-        return preferred
-    fallback = doc_dir / f"{raw_file.stem}.md"
-    if fallback.exists():
-        return fallback
-    raise KBError(f"Markdown file not found in {doc_dir}")
+def find_doc_text_file(doc_dir: Path, safe_name: str) -> Path:
+    preferred_candidates = [
+        doc_dir / f"{safe_name}.md",
+        doc_dir / f"{safe_name}.txt",
+    ]
+    for candidate in preferred_candidates:
+        if candidate.exists():
+            return candidate
+    fallback_candidates = [
+        entry
+        for entry in sorted(doc_dir.iterdir(), key=lambda item: item.name)
+        if entry.is_file() and entry.name != "summary.txt" and entry.suffix.lower() in {".md", ".txt"}
+    ]
+    if fallback_candidates:
+        return fallback_candidates[0]
+    raise KBError(f"Extracted text file not found in {doc_dir}. Expected {safe_name}.md or {safe_name}.txt")
 
 
 def read_summary(doc_dir: Path) -> str:
@@ -410,8 +358,7 @@ def build_bm25_index(chunk_records: list[dict]) -> dict:
 
 def collect_doc_records(kb_name: str, doc_dir: Path) -> tuple[list[dict], dict]:
     ts, safe_name = parse_doc_dir_name(doc_dir)
-    raw_file = find_primary_source_file(doc_dir)
-    markdown_path = find_doc_markdown(doc_dir, safe_name, raw_file)
+    text_path = find_doc_text_file(doc_dir, safe_name)
     summary_path = doc_dir / "summary.txt"
     chunks_dir = doc_dir / "chunks"
     t2q_dir = doc_dir / "t2q"
@@ -421,8 +368,7 @@ def collect_doc_records(kb_name: str, doc_dir: Path) -> tuple[list[dict], dict]:
         raise KBError(f"T2Q directory not found: {t2q_dir}")
 
     summary = read_summary(doc_dir)
-    raw_sha1 = file_sha1(raw_file)
-    markdown_sha1 = file_sha1(markdown_path)
+    text_sha1 = file_sha1(text_path)
     total_chunk_count = len(list(chunks_dir.glob("chunk-*.md")))
     chunk_records = []
     chunk_lookup = {}
@@ -433,18 +379,18 @@ def collect_doc_records(kb_name: str, doc_dir: Path) -> tuple[list[dict], dict]:
             "id": stable_id(kb_name, doc_dir.name, "chunk", chunk_id, text),
             "kb": kb_name,
             "doc_id": doc_dir.name,
-            "file_name": raw_file.name,
+            "file_name": text_path.name,
             "uploaded_at": ts,
             "kind": "chunk",
             "chunk_id": chunk_id,
             "q_id": None,
             "path": str(chunk_path),
-            "source_md_path": str(markdown_path),
-            "source_file_path": str(raw_file),
+            "source_md_path": str(text_path),
+            "source_file_path": str(text_path),
             "summary_path": str(summary_path),
             "summary": summary,
-            "raw_sha1": raw_sha1,
-            "markdown_sha1": markdown_sha1,
+            "raw_sha1": text_sha1,
+            "markdown_sha1": text_sha1,
             "chunk_count": total_chunk_count,
             "target_chunk_path": str(chunk_path),
             "text": text,
@@ -465,18 +411,18 @@ def collect_doc_records(kb_name: str, doc_dir: Path) -> tuple[list[dict], dict]:
                 "id": stable_id(kb_name, doc_dir.name, "t2q", chunk_id, q_id, text),
                 "kb": kb_name,
                 "doc_id": doc_dir.name,
-                "file_name": raw_file.name,
+                "file_name": text_path.name,
                 "uploaded_at": ts,
                 "kind": "t2q",
                 "chunk_id": chunk_id,
                 "q_id": q_id,
                 "path": str(question_path),
-                "source_md_path": str(markdown_path),
-                "source_file_path": str(raw_file),
+                "source_md_path": str(text_path),
+                "source_file_path": str(text_path),
                 "summary_path": str(summary_path),
                 "summary": summary,
-                "raw_sha1": raw_sha1,
-                "markdown_sha1": markdown_sha1,
+                "raw_sha1": text_sha1,
+                "markdown_sha1": text_sha1,
                 "chunk_count": total_chunk_count,
                 "target_chunk_path": chunk_lookup[chunk_id]["path"],
                 "text": text,
@@ -485,16 +431,16 @@ def collect_doc_records(kb_name: str, doc_dir: Path) -> tuple[list[dict], dict]:
 
     summary_record = {
         "doc_id": doc_dir.name,
-        "file_name": raw_file.name,
+        "file_name": text_path.name,
         "uploaded_at": ts,
-        "source_file_path": str(raw_file),
-        "source_md_path": str(markdown_path),
+        "source_file_path": str(text_path),
+        "source_md_path": str(text_path),
         "summary_path": str(summary_path),
         "summary": summary,
         "chunk_count": len(chunk_records),
         "t2q_count": len(t2q_records),
-        "raw_sha1": raw_sha1,
-        "markdown_sha1": markdown_sha1,
+        "raw_sha1": text_sha1,
+        "markdown_sha1": text_sha1,
     }
     return chunk_records + t2q_records, summary_record
 
@@ -570,6 +516,30 @@ def embed_texts(texts: list[str], batch_size: int = 10) -> list[list[float]]:
     return outputs
 
 
+def attach_missing_embeddings(records: list[dict]) -> list[dict]:
+    missing_indices = [idx for idx, item in enumerate(records) if "embedding" not in item or not item["embedding"]]
+    if not missing_indices:
+        return records
+    embeddings = embed_texts([records[idx]["text"] for idx in missing_indices])
+    if len(embeddings) != len(missing_indices):
+        raise KBError("Embedding count mismatch while persisting records.")
+    for idx, embedding in zip(missing_indices, embeddings):
+        records[idx]["embedding"] = embedding
+    return records
+
+
+def prepare_query_vector(query: str):
+    np = load_numpy()
+    faiss = load_faiss()
+    query_vector = np.asarray([embed_texts([query])[0]], dtype="float32")
+    faiss.normalize_L2(query_vector)
+    return query_vector
+
+
+def prepare_keyword_query_terms(query: str) -> Counter[str]:
+    return Counter(tokenize_for_bm25(query))
+
+
 def rerank_documents(query: str, documents: list[str], top_n: int) -> list[dict]:
     if not documents:
         return []
@@ -614,8 +584,9 @@ def write_faiss_index(index_path: Path, embeddings: list[list[float]]) -> None:
 
 def persist_kb_artifacts(paths: dict[str, Path], records: list[dict], manifest: dict) -> None:
     if records:
+        attach_missing_embeddings(records)
         write_jsonl(paths["vectors"], records)
-        write_faiss_index(paths["index"], embed_texts([item["text"] for item in records]))
+        write_faiss_index(paths["index"], [item["embedding"] for item in records])
         write_json(paths["bm25"], build_bm25_index(chunk_records_only(records)), indent=None)
     else:
         write_jsonl(paths["vectors"], [])
@@ -739,14 +710,10 @@ def delete_from_index(root_dir: Path, kb_name: str, doc_id: str) -> dict:
     return manifest
 
 
-def vector_search(records: list[dict], index, query: str, top_k: int) -> list[dict]:
+def vector_search(records: list[dict], index, query_vector, top_k: int) -> list[dict]:
     if not records or index is None:
         return []
-    np = load_numpy()
-    faiss = load_faiss()
-    query_embedding = np.asarray(embed_texts([query]), dtype="float32")
-    faiss.normalize_L2(query_embedding)
-    scores, indices = index.search(query_embedding, top_k)
+    scores, indices = index.search(query_vector, top_k)
     chunk_lookup = {
         (item["doc_id"], item["chunk_id"]): item
         for item in records
@@ -772,7 +739,7 @@ def vector_search(records: list[dict], index, query: str, top_k: int) -> list[di
     return sorted(merged.values(), key=lambda item: item["vector_score"], reverse=True)
 
 
-def keyword_search(records: list[dict], bm25_index: dict | None, query: str, top_k: int) -> list[dict]:
+def keyword_search(records: list[dict], bm25_index: dict | None, query_terms: Counter[str], top_k: int) -> list[dict]:
     if not records or not bm25_index:
         return []
     postings = bm25_index.get("postings", {})
@@ -787,7 +754,7 @@ def keyword_search(records: list[dict], bm25_index: dict | None, query: str, top
     b = float(bm25_index.get("b", BM25_B))
     chunk_lookup = {item["id"]: item for item in records if item["kind"] == "chunk"}
     scores: dict[str, float] = defaultdict(float)
-    for term, qtf in Counter(tokenize_for_bm25(query)).items():
+    for term, qtf in query_terms.items():
         term_postings = postings.get(term)
         if not term_postings:
             continue
@@ -900,12 +867,13 @@ def finalize_results(
 def recall_one_kb(
     root_dir: Path,
     kb_name: str,
-    query: str,
     *,
     topk: int | None,
     topn: int | None,
     rerank: bool,
     retrieval_mode: str,
+    query_vector=None,
+    query_terms: Counter[str] | None = None,
 ) -> tuple[list[dict], list[dict], tuple[int, int]]:
     mode = normalize_retrieval_mode(retrieval_mode)
     config, records, index, bm25_index = load_kb_bundle(
@@ -919,9 +887,13 @@ def recall_one_kb(
     semantic_candidates = []
     keyword_candidates = []
     if mode in {"semantic", "hybrid"}:
-        semantic_candidates = vector_search(records, index, query, top_k=candidate_limit)
+        if query_vector is None:
+            raise KBError("Missing query vector for semantic retrieval.")
+        semantic_candidates = vector_search(records, index, query_vector, top_k=candidate_limit)
     if mode in {"keyword", "hybrid"}:
-        keyword_candidates = keyword_search(records, bm25_index, query, top_k=candidate_limit)
+        if query_terms is None:
+            raise KBError("Missing query terms for keyword retrieval.")
+        keyword_candidates = keyword_search(records, bm25_index, query_terms, top_k=candidate_limit)
     return semantic_candidates, keyword_candidates, (effective_topk, effective_topn)
 
 
@@ -935,18 +907,22 @@ def search_one_kb(
     rerank: bool,
     retrieval_mode: str,
 ) -> list[dict]:
+    mode = normalize_retrieval_mode(retrieval_mode)
+    query_vector = prepare_query_vector(query) if mode in {"semantic", "hybrid"} else None
+    query_terms = prepare_keyword_query_terms(query) if mode in {"keyword", "hybrid"} else None
     semantic_candidates, keyword_candidates, (effective_topk, effective_topn) = recall_one_kb(
         root_dir,
         kb_name,
-        query,
         topk=topk,
         topn=topn,
         rerank=rerank,
-        retrieval_mode=retrieval_mode,
+        retrieval_mode=mode,
+        query_vector=query_vector,
+        query_terms=query_terms,
     )
     return finalize_results(
         query,
-        normalize_retrieval_mode(retrieval_mode),
+        mode,
         semantic_candidates,
         keyword_candidates,
         topk=effective_topk,
@@ -977,6 +953,8 @@ def search_across_kbs(
 ) -> list[dict]:
     mode = normalize_retrieval_mode(retrieval_mode)
     effective_topk, effective_topn = resolve_query_limits(None, topk, topn)
+    query_vector = prepare_query_vector(query) if mode in {"semantic", "hybrid"} else None
+    query_terms = prepare_keyword_query_terms(query) if mode in {"keyword", "hybrid"} else None
     semantic_candidates = []
     keyword_candidates = []
     for kb_name in list_kb_names(root_dir):
@@ -984,11 +962,12 @@ def search_across_kbs(
             kb_semantic, kb_keyword, _ = recall_one_kb(
                 root_dir,
                 kb_name,
-                query,
                 topk=effective_topk,
                 topn=effective_topn,
                 rerank=rerank,
                 retrieval_mode=mode,
+                query_vector=query_vector,
+                query_terms=query_terms,
             )
             semantic_candidates.extend(kb_semantic)
             keyword_candidates.extend(kb_keyword)
@@ -1069,7 +1048,6 @@ def run_doctor(root_dir: Path) -> int:
         "requests": module_available("requests"),
         "numpy": module_available("numpy"),
         "faiss": module_available("faiss"),
-        "markitdown": module_available("markitdown"),
         "jieba": module_available("jieba"),
         "root_dir": str(root_dir),
         "root_dir_exists": root_dir.exists(),
@@ -1086,11 +1064,6 @@ def parse_args() -> argparse.Namespace:
 
     doctor = subparsers.add_parser("doctor", help="Check runtime and dependency availability.")
     doctor.set_defaults(func=cmd_doctor)
-
-    convert = subparsers.add_parser("convert", help="Convert a source file into Markdown.")
-    convert.add_argument("--input", required=True, help="Source file path.")
-    convert.add_argument("--output", required=True, help="Markdown output path.")
-    convert.set_defaults(func=cmd_convert)
 
     index = subparsers.add_parser("index", help="Index one document directory and refresh both vector and BM25 KB indexes.")
     index.add_argument("--kb", required=True, help="Knowledge-base name.")
@@ -1130,26 +1103,6 @@ def parse_args() -> argparse.Namespace:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     return run_doctor(Path(args.root_dir))
-
-
-def cmd_convert(args: argparse.Namespace) -> int:
-    input_path = Path(args.input).expanduser()
-    output_path = Path(args.output).expanduser()
-    markdown = convert_source(input_path)
-    write_markdown_output(output_path, markdown)
-    print(
-        json.dumps(
-            {
-                "input": str(input_path),
-                "output": str(output_path),
-                "source_sha1": file_sha1(input_path),
-                "markdown_length": len(markdown),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
 
 
 def cmd_index(args: argparse.Namespace) -> int:

@@ -1,10 +1,10 @@
 # bailian_faiss_kb
 
-`bailian_faiss_kb` 是一个面向 OpenClaw 的技能，用于基于 Python、FAISS、MarkItDown 和阿里云百炼向量能力，构建并查询本地文件型知识库。
+`bailian_faiss_kb` 是一个面向 OpenClaw 的技能，用于基于 Python、FAISS 和阿里云百炼向量能力，构建并查询本地文件型知识库。
 
 支持的能力包括：
 
-- 将上传文件转换为 Markdown
+- 消费 OpenClaw 预先抽取好的文本文件
 - 基于 `chunks/` 和 `t2q/` 建立或刷新知识库索引
 - 对整个知识库执行全量重建，同时重建语义与 BM25 索引
 - 在文档删除后从索引中移除对应记录
@@ -15,7 +15,6 @@
 
 - Python `3.10+`
 - `faiss-cpu`
-- `markitdown[all]`
 - `numpy`
 - `requests`
 - 百炼向量模型：`text-embedding-v4`
@@ -200,7 +199,7 @@ python .\src\bailian_faiss_kb\scripts\bailian_faiss_kb.py --root-dir C:\temp\ope
 - `requests: true`
 - `numpy: true`
 - `faiss: true`
-- `markitdown: true`
+- `jieba: true`
 
 如果这些字段都正常，这个 skill 的 Python 脚本已经可以使用。
 
@@ -240,6 +239,18 @@ python -m pip install -r src/bailian_faiss_kb/requirements.txt
 python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /tmp/openclaw-kb doctor
 ```
 
+进入这个工具之前，OpenClaw 必须先把原始文件抽取成文本，推荐保存为：
+
+```text
+/var/openclaw-kb/{kb}/{ts}-{safe_name}/{safe_name}.md
+```
+
+也兼容：
+
+```text
+/var/openclaw-kb/{kb}/{ts}-{safe_name}/{safe_name}.txt
+```
+
 ## 目录结构
 
 默认知识库根目录：
@@ -267,14 +278,6 @@ python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /tmp/openclaw
 - `src/bailian_faiss_kb/references/runtime-notes.md`
 
 ## 常用命令
-
-将文件转换为 Markdown：
-
-```bash
-python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb convert \
-  --input /var/openclaw-kb/regulation/202604111230-demo/demo.docx \
-  --output /var/openclaw-kb/regulation/202604111230-demo/demo.md
-```
 
 为单个文档目录建立索引：
 
@@ -334,6 +337,7 @@ python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw
 
 - 这个技能不会执行 shell 脚本，也不会下载远程安装脚本
 - 它只读写本地知识库文件，以及命令中显式传入的输入输出路径
+- 它不负责原始文件到文本的转换；这一步必须由 OpenClaw 在进入流程前完成
 - 网络访问仅限阿里云百炼的 HTTPS embedding 和 rerank 接口
 - 对外请求只会读取百炼 API Key，不会上传其他环境变量
 

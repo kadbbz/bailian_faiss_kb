@@ -5,7 +5,7 @@
 - 文件该存到哪里
 - 文件名必须长成什么样
 
-每次新增、处理、摘要、切片、T2Q、索引、删除之前，都先按这里的规则检查一次。
+每次新增、抽取文本、摘要、切片、T2Q、索引、删除之前，都先按这里的规则检查一次。
 
 ## 先确定 3 个值
 
@@ -46,10 +46,10 @@
 
 ## 固定文件名
 
-一个文档目录下，文件名必须固定，不要自行改写：
+一个文档目录下，文本资产文件名必须固定，不要自行改写：
 
-- 原始文件：`{safe_name}{ext}`
-- Markdown：`{safe_name}.md`
+- 抽取后的文本：`{safe_name}.md`
+- 可兼容的纯文本：`{safe_name}.txt`
 - 摘要：`summary.txt`
 - chunk：`chunk-00001.md`
 - t2q：`00001-q-1.md`
@@ -64,7 +64,7 @@
 
 ## 存放文件夹规则
 
-以知识库 `regulation`、上传时间 `{ts}`、文件名 `xx.docx` 为例：
+以知识库 `regulation`、上传时间 `{ts}`、文件名 `xx.docx` 为例，假设 OpenClaw 已将其抽取为 `xx.md`：
 
 ```text
 /var/openclaw-kb/
@@ -75,7 +75,6 @@
     manifest.json
     vectors.jsonl
     {ts}-xx/
-      xx.docx
       xx.md
       summary.txt
       chunks/
@@ -93,7 +92,7 @@
 - 不要额外再套一层 `files/`
 - 不要把 `summary.txt`、`chunks/`、`t2q/` 放到知识库根目录
 - 不要把不同文件的 chunk 混在同一个 `chunks/` 目录下
-- 原文件、`.md`、`summary.txt`、`chunks/`、`t2q/` 必须属于同一个文档目录
+- 抽取出的文本文件、`summary.txt`、`chunks/`、`t2q/` 必须属于同一个文档目录
 
 简单说：
 
@@ -105,9 +104,9 @@
 
 文件保存：
 
-- `/var/openclaw-kb/{kb}/{ts}-{safe_name}/{safe_name}{ext}`
+- `/var/openclaw-kb/{kb}/{ts}-{safe_name}/{safe_name}.md`
 
-文件处理：
+文本抽取：
 
 - `/var/openclaw-kb/{kb}/{ts}-{safe_name}/{safe_name}.md`
 

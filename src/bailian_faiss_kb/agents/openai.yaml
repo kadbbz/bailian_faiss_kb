@@ -2,7 +2,7 @@ interface:
   display_name: "基于阿里云百炼、Faiss 和 BM25 的知识库"
   short_description: "本地多知识库综合检索与索引管理"
   brand_color: "#D97706"
-  default_prompt: "Use $bailian_faiss_kb to add files, rebuild a KB, or run hybrid, semantic, or keyword search over one or all local knowledge bases."
+  default_prompt: "Use $bailian_faiss_kb after OpenClaw has extracted source files into text, then rebuild a KB or run hybrid, semantic, or keyword search over one or all local knowledge bases."
 
 policy:
   allow_implicit_invocation: true

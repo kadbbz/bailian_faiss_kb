@@ -8,6 +8,7 @@
 - 可选重排模型：`qwen3-rerank`
 - 根目录默认值：`/var/openclaw-kb`
 - 默认查询模式：`hybrid`
+- 输入前提：OpenClaw 已经把原始文件抽取为文本
 - `topk` 与 `topN` 写入知识库自己的 `config.json`
 
 ## 目录结构
@@ -27,8 +28,7 @@
 
 每个文档目录包含：
 
-- 原始文件
-- 转换后的 `{safe_name}.md`
+- OpenClaw 抽取后的 `{safe_name}.md` 或 `{safe_name}.txt`
 - `summary.txt`
 - `chunks/chunk-00001.md`
 - `t2q/00001-q-1.md`
