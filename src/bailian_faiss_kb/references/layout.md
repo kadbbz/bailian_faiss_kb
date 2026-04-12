@@ -71,6 +71,7 @@
   regulation/
     config.json
     index.faiss
+    bm25.json
     manifest.json
     vectors.jsonl
     {ts}-xx/
@@ -97,6 +98,7 @@
 简单说：
 
 - KB 级目录只放索引与文档目录
+- KB 级索引文件包含 `vectors.jsonl`、`index.faiss`、`bm25.json`、`manifest.json`
 - 文档级目录只放当前文件自己的所有产物
 
 ## 每一步对应的固定落点

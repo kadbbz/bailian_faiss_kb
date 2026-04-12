@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
@@ -17,8 +19,15 @@ EMBEDDING_DIMENSIONS = 1024
 DEFAULT_ROOT_DIR = "/var/openclaw-kb"
 DEFAULT_TOPK = 10
 DEFAULT_TOPN = 10
+DEFAULT_RETRIEVAL_MODE = "hybrid"
 EMBEDDING_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
 RERANK_URL = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+BM25_K1 = 1.2
+BM25_B = 0.75
+RRF_K = 60
+TOKENIZER_NAME = "jieba_v1"
+RETRIEVAL_MODES = {"semantic", "keyword", "hybrid"}
+PROTECTED_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._:/-][A-Za-z0-9]+)*")
 SUPPORTED_EXTENSIONS = {
     ".csv",
     ".doc",
@@ -77,6 +86,14 @@ def load_markitdown():
     return MarkItDown
 
 
+def load_jieba():
+    try:
+        import jieba
+    except ImportError as exc:
+        raise KBError("Missing dependency 'jieba'. Run: python3 -m pip install -r requirements.txt") from exc
+    return jieba
+
+
 def now_iso() -> str:
     from datetime import datetime, timezone
 
@@ -90,10 +107,15 @@ def read_json(path: Path, default):
         return json.load(handle)
 
 
-def write_json(path: Path, data) -> None:
+def write_json(path: Path, data, *, indent: int | None = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
+        dump_kwargs = {"ensure_ascii": False}
+        if indent is None:
+            dump_kwargs["separators"] = (",", ":")
+        else:
+            dump_kwargs["indent"] = indent
+        json.dump(data, handle, **dump_kwargs)
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -172,7 +194,16 @@ def kb_paths(root_dir: Path, kb_name: str) -> dict[str, Path]:
         "manifest": root / "manifest.json",
         "vectors": root / "vectors.jsonl",
         "index": root / "index.faiss",
+        "bm25": root / "bm25.json",
     }
+
+
+def normalize_retrieval_mode(value: str | None) -> str:
+    mode = (value or DEFAULT_RETRIEVAL_MODE).strip().lower()
+    if mode not in RETRIEVAL_MODES:
+        allowed = ", ".join(sorted(RETRIEVAL_MODES))
+        raise KBError(f"Unsupported retrieval mode: {value}. Expected one of: {allowed}")
+    return mode
 
 
 def ensure_kb_config(
@@ -192,6 +223,10 @@ def ensure_kb_config(
             "embedding_model": EMBEDDING_MODEL,
             "embedding_dimensions": EMBEDDING_DIMENSIONS,
             "rerank_model": RERANK_MODEL,
+            "retrieval_mode": DEFAULT_RETRIEVAL_MODE,
+            "bm25_k1": BM25_K1,
+            "bm25_b": BM25_B,
+            "bm25_tokenizer": TOKENIZER_NAME,
             "topk": DEFAULT_TOPK,
             "topN": DEFAULT_TOPN,
             "updated_at": now_iso(),
@@ -202,8 +237,12 @@ def ensure_kb_config(
     config["embedding_model"] = EMBEDDING_MODEL
     config["embedding_dimensions"] = EMBEDDING_DIMENSIONS
     config["rerank_model"] = RERANK_MODEL
-    config["topk"] = normalize_positive(topk or config.get("topk", DEFAULT_TOPK), "topk")
-    config["topN"] = normalize_positive(topn or config.get("topN", DEFAULT_TOPN), "topN")
+    config["retrieval_mode"] = normalize_retrieval_mode(config.get("retrieval_mode", DEFAULT_RETRIEVAL_MODE))
+    config["bm25_k1"] = BM25_K1
+    config["bm25_b"] = BM25_B
+    config["bm25_tokenizer"] = TOKENIZER_NAME
+    config["topk"] = normalize_positive(topk if topk is not None else config.get("topk", DEFAULT_TOPK), "topk")
+    config["topN"] = normalize_positive(topn if topn is not None else config.get("topN", DEFAULT_TOPN), "topN")
     if config["topN"] > config["topk"]:
         raise KBError("topN must be less than or equal to topk.")
     config["updated_at"] = now_iso()
@@ -287,6 +326,86 @@ def parse_t2q_name(path: Path) -> tuple[str, str]:
 
 def read_markdown_file(path: Path) -> str:
     return normalize_text(path.read_text(encoding="utf-8", errors="ignore"))
+
+
+def is_cjk_char(char: str) -> bool:
+    return "\u4e00" <= char <= "\u9fff"
+
+
+def clean_lexical_token(token: str) -> str:
+    token = token.strip().lower()
+    token = token.strip("`*_#>~[](){}<>\"'.,;:!?，。；：！？、|\\/=+·")
+    return token
+
+
+def should_keep_lexical_token(token: str) -> bool:
+    if not token:
+        return False
+    if not any(char.isalnum() or is_cjk_char(char) for char in token):
+        return False
+    if all(is_cjk_char(char) for char in token) and len(token) <= 1:
+        return False
+    if token.isdigit() and len(token) <= 1:
+        return False
+    return True
+
+
+def tokenize_lexical_segment(text: str) -> list[str]:
+    if not text.strip():
+        return []
+    jieba = load_jieba()
+    tokens = []
+    for raw in jieba.lcut(text, cut_all=False):
+        token = clean_lexical_token(raw)
+        if should_keep_lexical_token(token):
+            tokens.append(token)
+    return tokens
+
+
+def tokenize_for_bm25(text: str) -> list[str]:
+    text = normalize_text(text)
+    tokens = []
+    last = 0
+    for match in PROTECTED_TOKEN_RE.finditer(text):
+        tokens.extend(tokenize_lexical_segment(text[last : match.start()]))
+        token = clean_lexical_token(match.group(0))
+        if should_keep_lexical_token(token):
+            tokens.append(token)
+        last = match.end()
+    tokens.extend(tokenize_lexical_segment(text[last:]))
+    return tokens
+
+
+def chunk_records_only(records: list[dict]) -> list[dict]:
+    return [item for item in records if item["kind"] == "chunk"]
+
+
+def build_bm25_index(chunk_records: list[dict]) -> dict:
+    postings: dict[str, list[list[str | int]]] = defaultdict(list)
+    doc_lengths: dict[str, int] = {}
+    total_terms = 0
+    for record in chunk_records:
+        tokens = tokenize_for_bm25(record["text"])
+        doc_lengths[record["id"]] = len(tokens)
+        total_terms += len(tokens)
+        if not tokens:
+            continue
+        frequencies = Counter(tokens)
+        for term, tf in frequencies.items():
+            postings[term].append([record["id"], int(tf)])
+    for term in postings:
+        postings[term].sort(key=lambda item: item[0])
+    doc_count = len(chunk_records)
+    return {
+        "schema_version": 1,
+        "tokenizer": TOKENIZER_NAME,
+        "k1": BM25_K1,
+        "b": BM25_B,
+        "doc_count": doc_count,
+        "avgdl": (float(total_terms) / doc_count) if doc_count else 0.0,
+        "doc_lengths": doc_lengths,
+        "postings": dict(sorted(postings.items())),
+    }
 
 
 def collect_doc_records(kb_name: str, doc_dir: Path) -> tuple[list[dict], dict]:
@@ -497,24 +616,65 @@ def persist_kb_artifacts(paths: dict[str, Path], records: list[dict], manifest: 
     if records:
         write_jsonl(paths["vectors"], records)
         write_faiss_index(paths["index"], embed_texts([item["text"] for item in records]))
+        write_json(paths["bm25"], build_bm25_index(chunk_records_only(records)), indent=None)
     else:
         write_jsonl(paths["vectors"], [])
         if paths["index"].exists():
             paths["index"].unlink()
+        if paths["bm25"].exists():
+            paths["bm25"].unlink()
     write_json(paths["manifest"], manifest)
 
 
-def load_index_bundle(kb_root: Path, kb_name: str) -> tuple[dict, list[dict], object | None]:
+def load_kb_bundle(
+    kb_root: Path,
+    kb_name: str,
+    *,
+    load_vector_index: bool,
+    load_bm25_index: bool,
+) -> tuple[dict, list[dict], object | None, dict | None]:
     paths = kb_paths(kb_root, kb_name)
     config = read_json(paths["config"], default=None)
     if config is None:
         raise KBError(f"Knowledge base config not found: {kb_name}")
     vectors = read_jsonl(paths["vectors"])
     index = None
-    if paths["index"].exists():
+    if load_vector_index and paths["index"].exists():
         faiss = load_faiss()
         index = faiss.read_index(str(paths["index"]))
-    return config, vectors, index
+    bm25_index = None
+    if load_bm25_index:
+        bm25_index = read_json(paths["bm25"], default=None)
+        if bm25_index is None:
+            bm25_index = build_bm25_index(chunk_records_only(vectors))
+    return config, vectors, index, bm25_index
+
+
+def build_kb_manifest(root_dir: Path, kb_name: str, config: dict, records: list[dict], *, extra: dict | None = None) -> dict:
+    document_summaries = summarize_documents_from_records(records)
+    manifest = {
+        "kb_name": kb_name,
+        "root_dir": str(root_dir),
+        "indexed_at": now_iso(),
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_dimensions": EMBEDDING_DIMENSIONS,
+        "rerank_model": RERANK_MODEL,
+        "retrieval_mode": config["retrieval_mode"],
+        "bm25_k1": BM25_K1,
+        "bm25_b": BM25_B,
+        "bm25_tokenizer": TOKENIZER_NAME,
+        "topk": config["topk"],
+        "topN": config["topN"],
+        "document_count": len(document_summaries),
+        "vector_count": len(records),
+        "chunk_count": sum(1 for item in records if item["kind"] == "chunk"),
+        "t2q_count": sum(1 for item in records if item["kind"] == "t2q"),
+        "bm25_doc_count": sum(1 for item in records if item["kind"] == "chunk"),
+        "documents": document_summaries,
+    }
+    if extra:
+        manifest.update(extra)
+    return manifest
 
 
 def index_kb(root_dir: Path, kb_name: str, doc_dir: Path, *, topk: int | None, topn: int | None) -> dict:
@@ -525,23 +685,27 @@ def index_kb(root_dir: Path, kb_name: str, doc_dir: Path, *, topk: int | None, t
     existing_records = [item for item in read_jsonl(paths["vectors"]) if item["doc_id"] != doc_manifest["doc_id"]]
     merged_records = existing_records + doc_records
     merged_records.sort(key=lambda item: (item["doc_id"], item["kind"], item["chunk_id"] or "", item["q_id"] or ""))
-    document_summaries = summarize_documents_from_records(merged_records)
-    manifest = {
-        "kb_name": kb_name,
-        "root_dir": str(root_dir),
-        "indexed_at": now_iso(),
-        "embedding_model": EMBEDDING_MODEL,
-        "embedding_dimensions": EMBEDDING_DIMENSIONS,
-        "rerank_model": RERANK_MODEL,
-        "topk": config["topk"],
-        "topN": config["topN"],
-        "document_count": len(document_summaries),
-        "vector_count": len(merged_records),
-        "chunk_count": sum(1 for item in merged_records if item["kind"] == "chunk"),
-        "t2q_count": sum(1 for item in merged_records if item["kind"] == "t2q"),
-        "documents": document_summaries,
-    }
+    manifest = build_kb_manifest(root_dir, kb_name, config, merged_records)
     persist_kb_artifacts(paths, merged_records, manifest)
+    return manifest
+
+
+def rebuild_kb(root_dir: Path, kb_name: str, *, topk: int | None, topn: int | None) -> dict:
+    config = ensure_kb_config(root_dir, kb_name, topk=topk, topn=topn)
+    paths = kb_paths(root_dir, kb_name)
+    records = []
+    for doc_dir in list_doc_dirs(root_dir, kb_name):
+        doc_records, _ = collect_doc_records(kb_name, doc_dir)
+        records.extend(doc_records)
+    records.sort(key=lambda item: (item["doc_id"], item["kind"], item["chunk_id"] or "", item["q_id"] or ""))
+    manifest = build_kb_manifest(
+        root_dir,
+        kb_name,
+        config,
+        records,
+        extra={"rebuilt": True},
+    )
+    persist_kb_artifacts(paths, records, manifest)
     return manifest
 
 
@@ -556,26 +720,21 @@ def delete_from_index(root_dir: Path, kb_name: str, doc_id: str) -> dict:
 
     remaining_records = [item for item in existing_records if item["doc_id"] != doc_id]
     deleted_count = len(existing_records) - len(remaining_records)
-
-    document_summaries = summarize_documents_from_records(remaining_records)
-
-    manifest = {
-        "kb_name": kb_name,
-        "root_dir": str(root_dir),
-        "indexed_at": now_iso(),
-        "embedding_model": EMBEDDING_MODEL,
-        "embedding_dimensions": EMBEDDING_DIMENSIONS,
-        "rerank_model": RERANK_MODEL,
-        "topk": config.get("topk", DEFAULT_TOPK),
-        "topN": config.get("topN", DEFAULT_TOPN),
-        "document_count": len(document_summaries),
-        "vector_count": len(remaining_records),
-        "chunk_count": sum(1 for item in remaining_records if item["kind"] == "chunk"),
-        "t2q_count": sum(1 for item in remaining_records if item["kind"] == "t2q"),
-        "documents": document_summaries,
-        "deleted_doc_id": doc_id,
-        "deleted_vector_count": deleted_count,
+    normalized_config = {
+        "retrieval_mode": normalize_retrieval_mode(config.get("retrieval_mode", DEFAULT_RETRIEVAL_MODE)),
+        "topk": normalize_positive(config.get("topk", DEFAULT_TOPK), "topk"),
+        "topN": normalize_positive(config.get("topN", DEFAULT_TOPN), "topN"),
     }
+    manifest = build_kb_manifest(
+        root_dir,
+        kb_name,
+        normalized_config,
+        remaining_records,
+        extra={
+            "deleted_doc_id": doc_id,
+            "deleted_vector_count": deleted_count,
+        },
+    )
     persist_kb_artifacts(paths, remaining_records, manifest)
     return manifest
 
@@ -600,16 +759,170 @@ def vector_search(records: list[dict], index, query: str, top_k: int) -> list[di
         row = dict(records[idx])
         target_chunk_id = row["chunk_id"]
         canonical = chunk_lookup.get((row["doc_id"], target_chunk_id), row)
-        key = (canonical["doc_id"], canonical["chunk_id"])
+        key = canonical["id"]
         existing = merged.get(key)
-        matched_by = {row["kind"]}
+        matched_via = {row["kind"]}
         if existing:
-            matched_by.update(existing.get("matched_by", []))
+            matched_via.update(existing.get("matched_via", []))
         collapsed = dict(canonical)
         collapsed["vector_score"] = max(float(score), existing["vector_score"] if existing else float(score))
-        collapsed["matched_by"] = sorted(matched_by)
+        collapsed["matched_by"] = ["semantic"]
+        collapsed["matched_via"] = sorted(matched_via)
         merged[key] = collapsed
     return sorted(merged.values(), key=lambda item: item["vector_score"], reverse=True)
+
+
+def keyword_search(records: list[dict], bm25_index: dict | None, query: str, top_k: int) -> list[dict]:
+    if not records or not bm25_index:
+        return []
+    postings = bm25_index.get("postings", {})
+    if not postings:
+        return []
+    doc_count = int(bm25_index.get("doc_count", 0))
+    if doc_count <= 0:
+        return []
+    doc_lengths = bm25_index.get("doc_lengths", {})
+    avgdl = float(bm25_index.get("avgdl", 0.0))
+    k1 = float(bm25_index.get("k1", BM25_K1))
+    b = float(bm25_index.get("b", BM25_B))
+    chunk_lookup = {item["id"]: item for item in records if item["kind"] == "chunk"}
+    scores: dict[str, float] = defaultdict(float)
+    for term, qtf in Counter(tokenize_for_bm25(query)).items():
+        term_postings = postings.get(term)
+        if not term_postings:
+            continue
+        df = len(term_postings)
+        idf = math.log(1.0 + (doc_count - df + 0.5) / (df + 0.5))
+        for doc_key, tf in term_postings:
+            doc_length = float(doc_lengths.get(doc_key, 0))
+            denominator = float(tf) + k1 * (1.0 - b + (b * doc_length / avgdl if avgdl else 0.0))
+            if denominator <= 0:
+                continue
+            scores[str(doc_key)] += qtf * idf * (float(tf) * (k1 + 1.0) / denominator)
+    ranked = []
+    for doc_key, score in scores.items():
+        canonical = chunk_lookup.get(doc_key)
+        if canonical is None:
+            continue
+        row = dict(canonical)
+        row["bm25_score"] = float(score)
+        row["matched_by"] = ["keyword"]
+        row["matched_via"] = ["chunk"]
+        ranked.append(row)
+    ranked.sort(key=lambda item: item["bm25_score"], reverse=True)
+    return ranked[:top_k]
+
+
+def recall_limit(topk: int, rerank: bool) -> int:
+    return max(topk, 20) if rerank else topk
+
+
+def resolve_query_limits(config: dict | None, topk: int | None, topn: int | None) -> tuple[int, int]:
+    config = config or {}
+    effective_topk = normalize_positive(topk if topk is not None else config.get("topk", DEFAULT_TOPK), "topk")
+    effective_topn = normalize_positive(topn if topn is not None else config.get("topN", DEFAULT_TOPN), "topN")
+    if effective_topn > effective_topk:
+        raise KBError("topN must be less than or equal to topk.")
+    return effective_topk, effective_topn
+
+
+def sort_candidates_by_score(candidates: list[dict], field: str) -> list[dict]:
+    return sorted(candidates, key=lambda item: item.get(field, float("-inf")), reverse=True)
+
+
+def fuse_ranked_candidates(semantic_candidates: list[dict], keyword_candidates: list[dict]) -> list[dict]:
+    merged = {}
+    for method, candidates in (("semantic", semantic_candidates), ("keyword", keyword_candidates)):
+        for rank, candidate in enumerate(candidates, start=1):
+            key = candidate["id"]
+            existing = merged.get(key)
+            row = dict(existing or candidate)
+            row["fusion_score"] = float(row.get("fusion_score", 0.0)) + (1.0 / (RRF_K + rank))
+            matched_by = set(row.get("matched_by", []))
+            matched_by.update(candidate.get("matched_by", []))
+            matched_by.add(method)
+            row["matched_by"] = sorted(matched_by)
+            matched_via = set(row.get("matched_via", []))
+            matched_via.update(candidate.get("matched_via", []))
+            row["matched_via"] = sorted(matched_via)
+            if "vector_score" in candidate:
+                row["vector_score"] = max(float(candidate["vector_score"]), float(row.get("vector_score", float("-inf"))))
+            if "bm25_score" in candidate:
+                row["bm25_score"] = max(float(candidate["bm25_score"]), float(row.get("bm25_score", float("-inf"))))
+            merged[key] = row
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            item.get("fusion_score", float("-inf")),
+            item.get("vector_score", float("-inf")),
+            item.get("bm25_score", float("-inf")),
+        ),
+        reverse=True,
+    )
+
+
+def finalize_results(
+    query: str,
+    retrieval_mode: str,
+    semantic_candidates: list[dict],
+    keyword_candidates: list[dict],
+    *,
+    topk: int,
+    topn: int,
+    rerank: bool,
+) -> list[dict]:
+    if retrieval_mode == "semantic":
+        merged = sort_candidates_by_score(semantic_candidates, "vector_score")
+    elif retrieval_mode == "keyword":
+        merged = sort_candidates_by_score(keyword_candidates, "bm25_score")
+    else:
+        merged = fuse_ranked_candidates(
+            sort_candidates_by_score(semantic_candidates, "vector_score"),
+            sort_candidates_by_score(keyword_candidates, "bm25_score"),
+        )
+    if not merged:
+        return []
+    if not rerank:
+        final = merged[:topn]
+    else:
+        rerank_candidates = merged[: recall_limit(topk, rerank=True)]
+        reranked = rerank_documents(query, [item["text"] for item in rerank_candidates], top_n=topn)
+        final = []
+        for item in reranked:
+            row = dict(rerank_candidates[item["index"]])
+            row["rerank_score"] = float(item["relevance_score"])
+            final.append(row)
+    for item in final:
+        item["retrieval_mode"] = retrieval_mode
+    return final
+
+
+def recall_one_kb(
+    root_dir: Path,
+    kb_name: str,
+    query: str,
+    *,
+    topk: int | None,
+    topn: int | None,
+    rerank: bool,
+    retrieval_mode: str,
+) -> tuple[list[dict], list[dict], tuple[int, int]]:
+    mode = normalize_retrieval_mode(retrieval_mode)
+    config, records, index, bm25_index = load_kb_bundle(
+        root_dir,
+        kb_name,
+        load_vector_index=mode in {"semantic", "hybrid"},
+        load_bm25_index=mode in {"keyword", "hybrid"},
+    )
+    effective_topk, effective_topn = resolve_query_limits(config, topk, topn)
+    candidate_limit = recall_limit(effective_topk, rerank)
+    semantic_candidates = []
+    keyword_candidates = []
+    if mode in {"semantic", "hybrid"}:
+        semantic_candidates = vector_search(records, index, query, top_k=candidate_limit)
+    if mode in {"keyword", "hybrid"}:
+        keyword_candidates = keyword_search(records, bm25_index, query, top_k=candidate_limit)
+    return semantic_candidates, keyword_candidates, (effective_topk, effective_topn)
 
 
 def search_one_kb(
@@ -620,25 +933,26 @@ def search_one_kb(
     topk: int | None,
     topn: int | None,
     rerank: bool,
+    retrieval_mode: str,
 ) -> list[dict]:
-    config, records, index = load_index_bundle(root_dir, kb_name)
-    effective_topk = normalize_positive(topk or config.get("topk", DEFAULT_TOPK), "topk")
-    effective_topn = normalize_positive(topn or config.get("topN", DEFAULT_TOPN), "topN")
-    if effective_topn > effective_topk:
-        raise KBError("topN must be less than or equal to topk.")
-    candidates = vector_search(records, index, query, top_k=effective_topk if not rerank else max(effective_topk, 20))
-    if not candidates:
-        return []
-    if not rerank:
-        return candidates[:effective_topn]
-    rerank_candidates = candidates[: max(effective_topk, 20)]
-    reranked = rerank_documents(query, [item["text"] for item in rerank_candidates], top_n=effective_topn)
-    final = []
-    for item in reranked:
-        row = dict(rerank_candidates[item["index"]])
-        row["rerank_score"] = float(item["relevance_score"])
-        final.append(row)
-    return final
+    semantic_candidates, keyword_candidates, (effective_topk, effective_topn) = recall_one_kb(
+        root_dir,
+        kb_name,
+        query,
+        topk=topk,
+        topn=topn,
+        rerank=rerank,
+        retrieval_mode=retrieval_mode,
+    )
+    return finalize_results(
+        query,
+        normalize_retrieval_mode(retrieval_mode),
+        semantic_candidates,
+        keyword_candidates,
+        topk=effective_topk,
+        topn=effective_topn,
+        rerank=rerank,
+    )
 
 
 def list_kb_names(root_dir: Path) -> list[str]:
@@ -659,26 +973,36 @@ def search_across_kbs(
     topk: int | None,
     topn: int | None,
     rerank: bool,
+    retrieval_mode: str,
 ) -> list[dict]:
-    all_candidates = []
+    mode = normalize_retrieval_mode(retrieval_mode)
+    effective_topk, effective_topn = resolve_query_limits(None, topk, topn)
+    semantic_candidates = []
+    keyword_candidates = []
     for kb_name in list_kb_names(root_dir):
         try:
-            all_candidates.extend(search_one_kb(root_dir, kb_name, query, topk=topk, topn=topn or DEFAULT_TOPN, rerank=False))
+            kb_semantic, kb_keyword, _ = recall_one_kb(
+                root_dir,
+                kb_name,
+                query,
+                topk=effective_topk,
+                topn=effective_topn,
+                rerank=rerank,
+                retrieval_mode=mode,
+            )
+            semantic_candidates.extend(kb_semantic)
+            keyword_candidates.extend(kb_keyword)
         except KBError:
             continue
-    all_candidates.sort(key=lambda item: item["vector_score"], reverse=True)
-    effective_topk = normalize_positive(topk or DEFAULT_TOPK, "topk")
-    effective_topn = normalize_positive(topn or DEFAULT_TOPN, "topN")
-    merged = all_candidates[: max(effective_topk, 20 if rerank else effective_topn)]
-    if not rerank:
-        return merged[:effective_topn]
-    reranked = rerank_documents(query, [item["text"] for item in merged], top_n=effective_topn)
-    final = []
-    for item in reranked:
-        row = dict(merged[item["index"]])
-        row["rerank_score"] = float(item["relevance_score"])
-        final.append(row)
-    return final
+    return finalize_results(
+        query,
+        mode,
+        semantic_candidates,
+        keyword_candidates,
+        topk=effective_topk,
+        topn=effective_topn,
+        rerank=rerank,
+    )
 
 
 def render_markdown_results(results: list[dict]) -> str:
@@ -746,6 +1070,7 @@ def run_doctor(root_dir: Path) -> int:
         "numpy": module_available("numpy"),
         "faiss": module_available("faiss"),
         "markitdown": module_available("markitdown"),
+        "jieba": module_available("jieba"),
         "root_dir": str(root_dir),
         "root_dir_exists": root_dir.exists(),
         "root_dir_writable": os.access(root_dir, os.W_OK) if root_dir.exists() else os.access(root_dir.parent, os.W_OK),
@@ -755,7 +1080,7 @@ def run_doctor(root_dir: Path) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Operate an OpenClaw knowledge base with Bailian + FAISS.")
+    parser = argparse.ArgumentParser(description="Operate an OpenClaw knowledge base with Bailian, FAISS, and BM25.")
     parser.add_argument("--root-dir", default=DEFAULT_ROOT_DIR, help="Knowledge-base root directory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -767,14 +1092,20 @@ def parse_args() -> argparse.Namespace:
     convert.add_argument("--output", required=True, help="Markdown output path.")
     convert.set_defaults(func=cmd_convert)
 
-    index = subparsers.add_parser("index", help="Index one document directory into a KB-level FAISS index.")
+    index = subparsers.add_parser("index", help="Index one document directory and refresh both vector and BM25 KB indexes.")
     index.add_argument("--kb", required=True, help="Knowledge-base name.")
     index.add_argument("--doc-dir", required=True, help="Document directory, e.g. /root/regulation/{ts}-xx")
     index.add_argument("--topk", type=int, help="FAISS recall top-k to store in KB config.")
     index.add_argument("--topN", type=int, help="Rerank top-N to store in KB config.")
     index.set_defaults(func=cmd_index)
 
-    delete = subparsers.add_parser("delete", help="Delete one document from the KB-level index and persist the result.")
+    rebuild = subparsers.add_parser("rebuild", help="Rebuild one KB from all document directories, including FAISS and BM25 artifacts.")
+    rebuild.add_argument("--kb", required=True, help="Knowledge-base name.")
+    rebuild.add_argument("--topk", type=int, help="FAISS recall top-k to store in KB config.")
+    rebuild.add_argument("--topN", type=int, help="Rerank top-N to store in KB config.")
+    rebuild.set_defaults(func=cmd_rebuild)
+
+    delete = subparsers.add_parser("delete", help="Delete one document from the KB-level vector and BM25 indexes and persist the result.")
     delete.add_argument("--kb", required=True, help="Knowledge-base name.")
     delete.add_argument("--doc-id", required=True, help="Document directory name, e.g. {ts}-xx")
     delete.set_defaults(func=cmd_delete)
@@ -782,6 +1113,12 @@ def parse_args() -> argparse.Namespace:
     query = subparsers.add_parser("query", help="Query one KB or all KBs and return Markdown.")
     query.add_argument("--kb", help="Knowledge-base name. Omit to search across all KBs.")
     query.add_argument("--query", required=True, help="Question text.")
+    query.add_argument(
+        "--retrieval-mode",
+        default=DEFAULT_RETRIEVAL_MODE,
+        choices=sorted(RETRIEVAL_MODES),
+        help="Retrieval mode: hybrid (default), semantic, or keyword.",
+    )
     query.add_argument("--topk", type=int, help="FAISS recall top-k override.")
     query.add_argument("--topN", type=int, help="Rerank top-N override.")
     query.add_argument("--rerank", action="store_true", help="Enable rerank.")
@@ -827,6 +1164,17 @@ def cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rebuild(args: argparse.Namespace) -> int:
+    manifest = rebuild_kb(
+        root_dir=Path(args.root_dir).expanduser(),
+        kb_name=args.kb,
+        topk=args.topk,
+        topn=args.topN,
+    )
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     manifest = delete_from_index(
         root_dir=Path(args.root_dir).expanduser(),
@@ -840,9 +1188,24 @@ def cmd_delete(args: argparse.Namespace) -> int:
 def cmd_query(args: argparse.Namespace) -> int:
     root_dir = Path(args.root_dir).expanduser()
     if args.kb:
-        results = search_one_kb(root_dir, args.kb, args.query, topk=args.topk, topn=args.topN, rerank=args.rerank)
+        results = search_one_kb(
+            root_dir,
+            args.kb,
+            args.query,
+            topk=args.topk,
+            topn=args.topN,
+            rerank=args.rerank,
+            retrieval_mode=args.retrieval_mode,
+        )
     else:
-        results = search_across_kbs(root_dir, args.query, topk=args.topk, topn=args.topN, rerank=args.rerank)
+        results = search_across_kbs(
+            root_dir,
+            args.query,
+            topk=args.topk,
+            topn=args.topN,
+            rerank=args.rerank,
+            retrieval_mode=args.retrieval_mode,
+        )
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
     else:

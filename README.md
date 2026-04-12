@@ -6,8 +6,9 @@
 
 - 将上传文件转换为 Markdown
 - 基于 `chunks/` 和 `t2q/` 建立或刷新知识库索引
+- 对整个知识库执行全量重建，同时重建语义与 BM25 索引
 - 在文档删除后从索引中移除对应记录
-- 对单个知识库或全部知识库执行语义检索
+- 对单个知识库或全部知识库执行综合、语义或关键词检索
 - 可选启用 `qwen3-rerank` 做结果重排
 
 ## 依赖组件
@@ -283,12 +284,28 @@ python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw
   --doc-dir /var/openclaw-kb/regulation/202604111230-demo
 ```
 
+重建整个知识库索引：
+
+```bash
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb rebuild \
+  --kb regulation
+```
+
 查询单个知识库：
 
 ```bash
 python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb query \
   --kb regulation \
   --query "报销审批流程是什么"
+```
+
+只做关键词查询：
+
+```bash
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb query \
+  --kb regulation \
+  --query "报销审批流程是什么" \
+  --retrieval-mode keyword
 ```
 
 查询全部知识库：

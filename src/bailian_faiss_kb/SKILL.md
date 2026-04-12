@@ -1,20 +1,23 @@
 ---
 name: bailian_faiss_kb
-description: 使用 Python、FAISS、MarkItDown、阿里云百炼 text-embedding-v4 与可选的 qwen3-rerank，维护基于文件目录的本地知识库；适用于文件转 Markdown、遍历 chunks 与 T2Q 建立索引，以及对指定知识库或全部知识库做语义查询。
+description: 使用 Python、FAISS、BM25、MarkItDown、阿里云百炼 text-embedding-v4 与可选的 qwen3-rerank，维护基于文件目录的本地知识库；适用于文件转 Markdown、遍历 chunks 与 T2Q 建立索引，以及对指定知识库或全部知识库做综合、语义或关键词查询。
 metadata: {"openclaw":{"requires":{"bins":["python3"]},"primaryEnv":"BAILIAN_SK"}}
 ---
 
-# 基于阿里云百炼和 FAISS 的知识库
+# 基于阿里云百炼、FAISS 和 BM25 的知识库
 
-这个 skill 用于配合 OpenClaw 自己的模型，维护目录化知识库。OpenClaw 负责保存原文件、生成摘要、做语义切片、生成 T2Q；Python 只负责文档转 Markdown、建立 FAISS 索引、执行查询。
+这个 skill 用于配合 OpenClaw 自己的模型，维护目录化知识库。OpenClaw 负责保存原文件、生成摘要、做语义切片、生成 T2Q；Python 负责文档转 Markdown、建立语义与 BM25 索引、执行查询。
 
 ## 适用场景
 
 - 将上传文件转换为 Markdown
 - 遍历某个知识库目录下的 `chunks/` 和 `t2q/` 建立或更新索引
+- 对整个知识库执行重建索引，同时重建语义与 BM25 工件
 - 在原始文档目录被删除后，从知识库级索引中移除对应数据
-- 对指定知识库做语义查询
-- 对全部知识库做语义查询
+- 对指定知识库做综合查询，默认同时使用语义与 BM25
+- 对指定知识库显式做语义查询
+- 对指定知识库显式做关键词查询
+- 对全部知识库做综合、语义或关键词查询
 
 ## 运行规则
 
@@ -23,20 +26,22 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"primaryEnv":"BAILIAN_SK"
 - 百炼密钥推荐使用环境变量 `BAILIAN_SK`；脚本同时兼容历史变量名 `BAILIAN-SK`
 - 向量模型固定为 `text-embedding-v4`
 - 向量维度固定为 `1024`
+- BM25 固定使用本地倒排索引和 `jieba` 分词
 - 可选重排模型固定为 `qwen3-rerank`
-- 配置项只有三个核心值：根目录、`topk`、`topN`
+- 查询默认模式固定为 `hybrid`
 - `summary` 必须是单行纯文本，保存为 `summary.txt`
-- T2Q 只作为召回代理，最终查询结果只能返回真实 chunk
+- T2Q 只作为语义召回代理，最终查询结果只能返回真实 chunk
+- BM25 只索引真实 `chunk`，不索引 `t2q`
 
 ## 安全边界
 
 - 这个 skill 不执行 shell、不下载远程脚本、不启动后台服务、不监听端口
 - Python 只读写知识库目录下的本地文件，以及脚本显式传入的输入/输出路径
-- 只有 `index` 和 `query --rerank` / `query` 需要联网，且只会向阿里云百炼官方接口发起 HTTPS 请求：
+- `index` 需要联网生成 embedding；`query --retrieval-mode semantic|hybrid` 需要联网生成查询 embedding；任意模式启用 `--rerank` 时需要联网做重排；且只会向阿里云百炼官方接口发起 HTTPS 请求：
   - `https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings`
   - `https://dashscope.aliyuncs.com/compatible-api/v1/reranks`
 - 只有百炼密钥会被读取并放入对应请求的 `Authorization` 请求头；脚本不会收集或上传其他环境变量
-- `convert` 与 `doctor` 不依赖网络，也不会读取百炼密钥
+- `convert`、`doctor` 与 `query --retrieval-mode keyword` 不依赖网络，也不会读取百炼密钥
 
 ## 先读路径规范
 
@@ -127,7 +132,7 @@ OpenClaw 需要：
 
 ### 6. 建立索引
 
-这一步调用 Python。它会遍历一个文档目录下的 `chunks/` 和 `t2q/`，将内容 embedding 后写入知识库级索引。
+这一步调用 Python。它会遍历一个文档目录下的 `chunks/` 和 `t2q/`，建立语义索引和 BM25 索引。
 
 ```bash
 python3 {baseDir}/scripts/bailian_faiss_kb.py index \
@@ -145,8 +150,32 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py index \
 - 用 `text-embedding-v4` 生成 1024 维向量
 - 将 chunk 与 T2Q 代理一起写入 `vectors.jsonl`
 - 更新 `index.faiss`
+- 仅基于真实 `chunk` 构建 BM25 倒排索引并写入 `bm25.json`
 - 更新 `manifest.json`
 - 将 `topk` 与 `topN` 写入知识库配置
+
+### 6.1 重建知识库索引
+
+这一步调用 Python。它会扫描某个知识库目录下的全部文档目录，重新生成整个知识库的语义索引和 BM25 索引。
+
+```bash
+python3 {baseDir}/scripts/bailian_faiss_kb.py rebuild \
+  --root-dir /var/openclaw-kb \
+  --kb regulation \
+  --topk 10 \
+  --topN 10
+```
+
+行为：
+
+- 遍历 `/var/openclaw-kb/{kb}/` 下所有合法文档目录
+- 读取每个文档目录中的 `chunks/*.md`
+- 读取每个文档目录中的 `t2q/*.md`
+- 重新写出完整的 `vectors.jsonl`
+- 重新写出完整的 `index.faiss`
+- 重新写出完整的 `bm25.json`
+- 重新写出完整的 `manifest.json`
+- 这个入口用于“全量重建”，保证语义检索和关键词检索始终一起重建
 
 ### 7. 删除
 
@@ -165,6 +194,7 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py delete \
 
 - 从 `vectors.jsonl` 中删除该文档对应的 chunk 和 T2Q 向量记录
 - 重写 `index.faiss`
+- 重写 `bm25.json`
 - 重写 `manifest.json`
 
 2. 再由 OpenClaw 删除整个文档目录：
@@ -177,7 +207,7 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py delete \
 
 这一步调用 Python。
 
-查指定知识库：
+默认综合查询指定知识库：
 
 ```bash
 python3 {baseDir}/scripts/bailian_faiss_kb.py query \
@@ -186,12 +216,32 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py query \
   --query "报销审批流程是什么"
 ```
 
-查全部知识库：
+默认综合查询全部知识库：
 
 ```bash
 python3 {baseDir}/scripts/bailian_faiss_kb.py query \
   --root-dir /var/openclaw-kb \
   --query "报销审批流程是什么"
+```
+
+显式只做语义查询：
+
+```bash
+python3 {baseDir}/scripts/bailian_faiss_kb.py query \
+  --root-dir /var/openclaw-kb \
+  --kb regulation \
+  --query "报销审批流程是什么" \
+  --retrieval-mode semantic
+```
+
+显式只做关键词查询：
+
+```bash
+python3 {baseDir}/scripts/bailian_faiss_kb.py query \
+  --root-dir /var/openclaw-kb \
+  --kb regulation \
+  --query "报销审批流程是什么" \
+  --retrieval-mode keyword
 ```
 
 需要更高精度时，显式启用 rerank：
@@ -201,6 +251,7 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py query \
   --root-dir /var/openclaw-kb \
   --kb regulation \
   --query "报销审批流程是什么" \
+  --retrieval-mode hybrid \
   --rerank
 ```
 
@@ -209,9 +260,12 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py query \
 - 若指定 `--kb regulation`，只查询该知识库
 - 若未指定 `--kb`，遍历根目录下所有知识库
 - 若知识库索引未加载，则从文件中加载
-- 无 rerank 时，按 `topk` 做 FAISS 召回，再按 `topN` 返回
-- 有 rerank 时，先召回候选，再去重到真实 chunk，最后 rerank 返回前 `topN`
-- 命中 `t2q` 时，必须反查回真实 chunk
+- 若未显式指定 `--retrieval-mode`，默认按 `hybrid` 做综合检索
+- `--retrieval-mode semantic` 时，按 FAISS 做语义召回；`chunk` 与 `t2q` 都参与召回，命中 `t2q` 时必须反查回真实 chunk
+- `--retrieval-mode keyword` 时，只按 BM25 检索真实 `chunk`；`t2q` 不参与关键词检索
+- `--retrieval-mode hybrid` 时，先分别做语义召回和 BM25 召回，再在真实 chunk 级别融合
+- 无 rerank 时，先做召回，再按 `topN` 返回
+- 有 rerank 时，先做召回与融合，再对真实 chunk 候选做 rerank，返回前 `topN`
 
 ## 查询输出格式
 
@@ -252,4 +306,5 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py doctor \
 - 这个 skill 不负责替 OpenClaw 生成摘要、切片或 T2Q 的内容，只负责规范这些文件应该长成什么样，以及如何调用 Python
 - 如果某个 chunk 文件或 T2Q 文件命名不合法，Python 会拒绝索引
 - 如果 `summary.txt` 超过 200 字，Python 会拒绝索引
+- 如果要让新建或更新过的文档参与 BM25，必须重新执行 `index`
 - 需要更详细的实现说明时，读取 [references/runtime-notes.md](./references/runtime-notes.md)
