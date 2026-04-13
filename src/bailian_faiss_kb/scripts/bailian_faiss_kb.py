@@ -9,6 +9,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -27,7 +28,8 @@ BM25_B = 0.75
 RRF_K = 60
 TOKENIZER_NAME = "jieba_v1"
 RETRIEVAL_MODES = {"semantic", "keyword", "hybrid"}
-PROTECTED_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._:/-][A-Za-z0-9]+)*")
+DEFAULT_PROTECTED_TOKEN_PATTERN = r"[A-Za-z0-9]+(?:[._:/-][A-Za-z0-9]+)*"
+PROTECTED_TERMS_KEY = "protected_terms"
 
 
 class KBError(RuntimeError):
@@ -82,12 +84,10 @@ def read_json(path: Path, default):
 def write_json(path: Path, data, *, indent: int | None = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        dump_kwargs = {"ensure_ascii": False}
         if indent is None:
-            dump_kwargs["separators"] = (",", ":")
+            json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
         else:
-            dump_kwargs["indent"] = indent
-        json.dump(data, handle, **dump_kwargs)
+            json.dump(data, handle, ensure_ascii=False, indent=indent)
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -156,6 +156,7 @@ def kb_paths(root_dir: Path, kb_name: str) -> dict[str, Path]:
     return {
         "root": root,
         "config": root / "config.json",
+        "protected_terms": root / "protected_terms.json",
         "manifest": root / "manifest.json",
         "vectors": root / "vectors.jsonl",
         "index": root / "index.faiss",
@@ -171,6 +172,101 @@ def normalize_retrieval_mode(value: str | None) -> str:
     return mode
 
 
+def normalize_protected_term(term: str) -> str:
+    value = collapse_text(term)
+    if not value:
+        raise KBError("Protected term must not be empty.")
+    return value
+
+
+def normalize_protected_terms(terms: Iterable[str] | None) -> list[str]:
+    ordered_terms = []
+    seen = set()
+    for raw in terms or []:
+        term = normalize_protected_term(str(raw))
+        key = term.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered_terms.append(term)
+    return ordered_terms
+
+
+def default_kb_config(root_dir: Path, kb_name: str) -> dict:
+    return {
+        "root_dir": str(root_dir),
+        "kb_name": kb_name,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_dimensions": EMBEDDING_DIMENSIONS,
+        "rerank_model": RERANK_MODEL,
+        "retrieval_mode": DEFAULT_RETRIEVAL_MODE,
+        "bm25_k1": BM25_K1,
+        "bm25_b": BM25_B,
+        "bm25_tokenizer": TOKENIZER_NAME,
+        "topk": DEFAULT_TOPK,
+        "topN": DEFAULT_TOPN,
+        "updated_at": now_iso(),
+    }
+
+
+def read_kb_protected_terms(paths: dict[str, Path], *, fallback_config: dict | None = None) -> list[str]:
+    protected_terms = read_json(paths["protected_terms"], default=None)
+    if protected_terms is None:
+        return normalize_protected_terms((fallback_config or {}).get(PROTECTED_TERMS_KEY, []))
+    if not isinstance(protected_terms, list):
+        raise KBError(f"{paths['protected_terms']} must contain a JSON array of protected terms.")
+    return normalize_protected_terms(protected_terms)
+
+
+def write_kb_protected_terms(paths: dict[str, Path], terms: Iterable[str]) -> None:
+    write_json(paths["protected_terms"], normalize_protected_terms(terms))
+
+
+def write_kb_config(paths: dict[str, Path], config: dict) -> None:
+    payload = dict(config)
+    payload.pop(PROTECTED_TERMS_KEY, None)
+    write_json(paths["config"], payload)
+
+
+def normalize_kb_config(
+    config: dict | None,
+    root_dir: Path,
+    kb_name: str,
+    *,
+    topk: int | None = None,
+    topn: int | None = None,
+    protected_terms: Iterable[str] | None = None,
+) -> dict:
+    normalized = dict(config or default_kb_config(root_dir, kb_name))
+    normalized["root_dir"] = str(root_dir)
+    normalized["kb_name"] = kb_name
+    normalized["embedding_model"] = EMBEDDING_MODEL
+    normalized["embedding_dimensions"] = EMBEDDING_DIMENSIONS
+    normalized["rerank_model"] = RERANK_MODEL
+    normalized["retrieval_mode"] = normalize_retrieval_mode(normalized.get("retrieval_mode", DEFAULT_RETRIEVAL_MODE))
+    normalized["bm25_k1"] = BM25_K1
+    normalized["bm25_b"] = BM25_B
+    normalized["bm25_tokenizer"] = TOKENIZER_NAME
+    normalized[PROTECTED_TERMS_KEY] = normalize_protected_terms(
+        protected_terms if protected_terms is not None else normalized.get(PROTECTED_TERMS_KEY, [])
+    )
+    normalized["topk"] = normalize_positive(topk if topk is not None else normalized.get("topk", DEFAULT_TOPK), "topk")
+    normalized["topN"] = normalize_positive(topn if topn is not None else normalized.get("topN", DEFAULT_TOPN), "topN")
+    if normalized["topN"] > normalized["topk"]:
+        raise KBError("topN must be less than or equal to topk.")
+    normalized["updated_at"] = normalized.get("updated_at", now_iso())
+    return normalized
+
+
+def load_kb_config(root_dir: Path, kb_name: str) -> dict:
+    paths = kb_paths(root_dir, kb_name)
+    config = read_json(paths["config"], default=None)
+    if config is None:
+        raise KBError(f"Knowledge base config not found: {kb_name}")
+    protected_terms = read_kb_protected_terms(paths, fallback_config=config)
+    return normalize_kb_config(config, root_dir, kb_name, protected_terms=protected_terms)
+
+
 def ensure_kb_config(
     root_dir: Path,
     kb_name: str,
@@ -180,38 +276,13 @@ def ensure_kb_config(
 ) -> dict:
     paths = kb_paths(root_dir, kb_name)
     paths["root"].mkdir(parents=True, exist_ok=True)
-    config = read_json(
-        paths["config"],
-        default={
-            "root_dir": str(root_dir),
-            "kb_name": kb_name,
-            "embedding_model": EMBEDDING_MODEL,
-            "embedding_dimensions": EMBEDDING_DIMENSIONS,
-            "rerank_model": RERANK_MODEL,
-            "retrieval_mode": DEFAULT_RETRIEVAL_MODE,
-            "bm25_k1": BM25_K1,
-            "bm25_b": BM25_B,
-            "bm25_tokenizer": TOKENIZER_NAME,
-            "topk": DEFAULT_TOPK,
-            "topN": DEFAULT_TOPN,
-            "updated_at": now_iso(),
-        },
-    )
-    config["root_dir"] = str(root_dir)
-    config["kb_name"] = kb_name
-    config["embedding_model"] = EMBEDDING_MODEL
-    config["embedding_dimensions"] = EMBEDDING_DIMENSIONS
-    config["rerank_model"] = RERANK_MODEL
-    config["retrieval_mode"] = normalize_retrieval_mode(config.get("retrieval_mode", DEFAULT_RETRIEVAL_MODE))
-    config["bm25_k1"] = BM25_K1
-    config["bm25_b"] = BM25_B
-    config["bm25_tokenizer"] = TOKENIZER_NAME
-    config["topk"] = normalize_positive(topk if topk is not None else config.get("topk", DEFAULT_TOPK), "topk")
-    config["topN"] = normalize_positive(topn if topn is not None else config.get("topN", DEFAULT_TOPN), "topN")
-    if config["topN"] > config["topk"]:
-        raise KBError("topN must be less than or equal to topk.")
+    raw_config = read_json(paths["config"], default=None)
+    protected_terms = read_kb_protected_terms(paths, fallback_config=raw_config)
+    config = normalize_kb_config(raw_config, root_dir, kb_name, topk=topk, topn=topn, protected_terms=protected_terms)
     config["updated_at"] = now_iso()
-    write_json(paths["config"], config)
+    write_kb_config(paths, config)
+    if not paths["protected_terms"].exists():
+        write_kb_protected_terms(paths, config.get(PROTECTED_TERMS_KEY, []))
     return config
 
 
@@ -298,10 +369,21 @@ def should_keep_lexical_token(token: str) -> bool:
     return True
 
 
-def tokenize_lexical_segment(text: str) -> list[str]:
+@lru_cache(maxsize=128)
+def compile_protected_token_re(protected_terms: tuple[str, ...]) -> re.Pattern[str]:
+    custom_patterns = [re.escape(term) for term in sorted(protected_terms, key=lambda item: (-len(item), item.casefold()))]
+    patterns = custom_patterns + [DEFAULT_PROTECTED_TOKEN_PATTERN]
+    return re.compile("|".join(patterns), re.IGNORECASE)
+
+
+def build_protected_token_matcher(protected_terms: Iterable[str] | None = None) -> re.Pattern[str]:
+    return compile_protected_token_re(tuple(normalize_protected_terms(protected_terms)))
+
+
+def tokenize_lexical_segment(text: str, *, jieba_module=None) -> list[str]:
     if not text.strip():
         return []
-    jieba = load_jieba()
+    jieba = jieba_module or load_jieba()
     tokens = []
     for raw in jieba.lcut(text, cut_all=False):
         token = clean_lexical_token(raw)
@@ -310,17 +392,25 @@ def tokenize_lexical_segment(text: str) -> list[str]:
     return tokens
 
 
-def tokenize_for_bm25(text: str) -> list[str]:
+def tokenize_for_bm25(
+    text: str,
+    *,
+    protected_terms: Iterable[str] | None = None,
+    matcher: re.Pattern[str] | None = None,
+    jieba_module=None,
+) -> list[str]:
     text = normalize_text(text)
     tokens = []
     last = 0
-    for match in PROTECTED_TOKEN_RE.finditer(text):
-        tokens.extend(tokenize_lexical_segment(text[last : match.start()]))
+    compiled_matcher = matcher or build_protected_token_matcher(protected_terms)
+    jieba = jieba_module or load_jieba()
+    for match in compiled_matcher.finditer(text):
+        tokens.extend(tokenize_lexical_segment(text[last : match.start()], jieba_module=jieba))
         token = clean_lexical_token(match.group(0))
         if should_keep_lexical_token(token):
             tokens.append(token)
         last = match.end()
-    tokens.extend(tokenize_lexical_segment(text[last:]))
+    tokens.extend(tokenize_lexical_segment(text[last:], jieba_module=jieba))
     return tokens
 
 
@@ -328,12 +418,19 @@ def chunk_records_only(records: list[dict]) -> list[dict]:
     return [item for item in records if item["kind"] == "chunk"]
 
 
-def build_bm25_index(chunk_records: list[dict]) -> dict:
+def build_bm25_index(chunk_records: list[dict], *, protected_terms: Iterable[str] | None = None) -> dict:
+    normalized_protected_terms = normalize_protected_terms(protected_terms)
+    matcher = build_protected_token_matcher(normalized_protected_terms)
+    jieba = load_jieba()
     postings: dict[str, list[list[str | int]]] = defaultdict(list)
     doc_lengths: dict[str, int] = {}
     total_terms = 0
     for record in chunk_records:
-        tokens = tokenize_for_bm25(record["text"])
+        tokens = tokenize_for_bm25(
+            record["text"],
+            matcher=matcher,
+            jieba_module=jieba,
+        )
         doc_lengths[record["id"]] = len(tokens)
         total_terms += len(tokens)
         if not tokens:
@@ -349,6 +446,7 @@ def build_bm25_index(chunk_records: list[dict]) -> dict:
         "tokenizer": TOKENIZER_NAME,
         "k1": BM25_K1,
         "b": BM25_B,
+        "protected_terms": normalized_protected_terms,
         "doc_count": doc_count,
         "avgdl": (float(total_terms) / doc_count) if doc_count else 0.0,
         "doc_lengths": doc_lengths,
@@ -536,8 +634,15 @@ def prepare_query_vector(query: str):
     return query_vector
 
 
-def prepare_keyword_query_terms(query: str) -> Counter[str]:
-    return Counter(tokenize_for_bm25(query))
+def prepare_keyword_query_terms(query: str, *, protected_terms: Iterable[str] | None = None) -> Counter[str]:
+    normalized_protected_terms = normalize_protected_terms(protected_terms)
+    return Counter(
+        tokenize_for_bm25(
+            query,
+            matcher=build_protected_token_matcher(normalized_protected_terms),
+            jieba_module=load_jieba(),
+        )
+    )
 
 
 def rerank_documents(query: str, documents: list[str], top_n: int) -> list[dict]:
@@ -582,12 +687,12 @@ def write_faiss_index(index_path: Path, embeddings: list[list[float]]) -> None:
     faiss.write_index(index, str(index_path))
 
 
-def persist_kb_artifacts(paths: dict[str, Path], records: list[dict], manifest: dict) -> None:
+def persist_kb_artifacts(paths: dict[str, Path], records: list[dict], manifest: dict, *, protected_terms: Iterable[str] | None = None) -> None:
     if records:
         attach_missing_embeddings(records)
         write_jsonl(paths["vectors"], records)
         write_faiss_index(paths["index"], [item["embedding"] for item in records])
-        write_json(paths["bm25"], build_bm25_index(chunk_records_only(records)), indent=None)
+        write_json(paths["bm25"], build_bm25_index(chunk_records_only(records), protected_terms=protected_terms), indent=None)
     else:
         write_jsonl(paths["vectors"], [])
         if paths["index"].exists():
@@ -603,11 +708,10 @@ def load_kb_bundle(
     *,
     load_vector_index: bool,
     load_bm25_index: bool,
+    config: dict | None = None,
 ) -> tuple[dict, list[dict], object | None, dict | None]:
     paths = kb_paths(kb_root, kb_name)
-    config = read_json(paths["config"], default=None)
-    if config is None:
-        raise KBError(f"Knowledge base config not found: {kb_name}")
+    effective_config = config or load_kb_config(kb_root, kb_name)
     vectors = read_jsonl(paths["vectors"])
     index = None
     if load_vector_index and paths["index"].exists():
@@ -617,8 +721,8 @@ def load_kb_bundle(
     if load_bm25_index:
         bm25_index = read_json(paths["bm25"], default=None)
         if bm25_index is None:
-            bm25_index = build_bm25_index(chunk_records_only(vectors))
-    return config, vectors, index, bm25_index
+            bm25_index = build_bm25_index(chunk_records_only(vectors), protected_terms=effective_config.get(PROTECTED_TERMS_KEY, []))
+    return effective_config, vectors, index, bm25_index
 
 
 def build_kb_manifest(root_dir: Path, kb_name: str, config: dict, records: list[dict], *, extra: dict | None = None) -> dict:
@@ -634,8 +738,10 @@ def build_kb_manifest(root_dir: Path, kb_name: str, config: dict, records: list[
         "bm25_k1": BM25_K1,
         "bm25_b": BM25_B,
         "bm25_tokenizer": TOKENIZER_NAME,
+        PROTECTED_TERMS_KEY: config.get(PROTECTED_TERMS_KEY, []),
         "topk": config["topk"],
         "topN": config["topN"],
+        "protected_term_count": len(config.get(PROTECTED_TERMS_KEY, [])),
         "document_count": len(document_summaries),
         "vector_count": len(records),
         "chunk_count": sum(1 for item in records if item["kind"] == "chunk"),
@@ -657,7 +763,7 @@ def index_kb(root_dir: Path, kb_name: str, doc_dir: Path, *, topk: int | None, t
     merged_records = existing_records + doc_records
     merged_records.sort(key=lambda item: (item["doc_id"], item["kind"], item["chunk_id"] or "", item["q_id"] or ""))
     manifest = build_kb_manifest(root_dir, kb_name, config, merged_records)
-    persist_kb_artifacts(paths, merged_records, manifest)
+    persist_kb_artifacts(paths, merged_records, manifest, protected_terms=config.get(PROTECTED_TERMS_KEY, []))
     return manifest
 
 
@@ -676,38 +782,120 @@ def rebuild_kb(root_dir: Path, kb_name: str, *, topk: int | None, topn: int | No
         records,
         extra={"rebuilt": True},
     )
-    persist_kb_artifacts(paths, records, manifest)
+    persist_kb_artifacts(paths, records, manifest, protected_terms=config.get(PROTECTED_TERMS_KEY, []))
     return manifest
 
 
 def delete_from_index(root_dir: Path, kb_name: str, doc_id: str) -> dict:
     paths = kb_paths(root_dir, kb_name)
-    config = read_json(paths["config"], default=None)
-    if config is None:
-        raise KBError(f"Knowledge base config not found: {kb_name}")
+    config = load_kb_config(root_dir, kb_name)
     existing_records = read_jsonl(paths["vectors"])
     if not existing_records and not paths["manifest"].exists():
         raise KBError(f"Knowledge base index not found: {kb_name}")
 
     remaining_records = [item for item in existing_records if item["doc_id"] != doc_id]
     deleted_count = len(existing_records) - len(remaining_records)
-    normalized_config = {
-        "retrieval_mode": normalize_retrieval_mode(config.get("retrieval_mode", DEFAULT_RETRIEVAL_MODE)),
-        "topk": normalize_positive(config.get("topk", DEFAULT_TOPK), "topk"),
-        "topN": normalize_positive(config.get("topN", DEFAULT_TOPN), "topN"),
-    }
     manifest = build_kb_manifest(
         root_dir,
         kb_name,
-        normalized_config,
+        config,
         remaining_records,
         extra={
             "deleted_doc_id": doc_id,
             "deleted_vector_count": deleted_count,
         },
     )
-    persist_kb_artifacts(paths, remaining_records, manifest)
+    persist_kb_artifacts(paths, remaining_records, manifest, protected_terms=config.get(PROTECTED_TERMS_KEY, []))
     return manifest
+
+
+def refresh_keyword_assets(root_dir: Path, kb_name: str, config: dict, *, extra: dict | None = None) -> dict:
+    paths = kb_paths(root_dir, kb_name)
+    records = read_jsonl(paths["vectors"])
+    manifest = build_kb_manifest(root_dir, kb_name, config, records, extra=extra)
+    if records:
+        write_json(paths["bm25"], build_bm25_index(chunk_records_only(records), protected_terms=config.get(PROTECTED_TERMS_KEY, [])), indent=None)
+    elif paths["bm25"].exists():
+        paths["bm25"].unlink()
+    write_json(paths["manifest"], manifest)
+    return manifest
+
+
+def add_protected_terms(root_dir: Path, kb_name: str, terms: Iterable[str]) -> dict:
+    config = ensure_kb_config(root_dir, kb_name)
+    requested_terms = normalize_protected_terms(terms)
+    existing_terms = list(config.get(PROTECTED_TERMS_KEY, []))
+    seen = {term.casefold() for term in existing_terms}
+    added_terms = []
+    for term in requested_terms:
+        key = term.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        existing_terms.append(term)
+        added_terms.append(term)
+    config[PROTECTED_TERMS_KEY] = existing_terms
+    config["updated_at"] = now_iso()
+    paths = kb_paths(root_dir, kb_name)
+    write_kb_config(paths, config)
+    write_kb_protected_terms(paths, existing_terms)
+    manifest = refresh_keyword_assets(
+        root_dir,
+        kb_name,
+        config,
+        extra={
+            "protected_terms_updated": True,
+            "protected_terms_added": added_terms,
+            "protected_terms_removed": [],
+        },
+    )
+    return {
+        "kb_name": kb_name,
+        "root_dir": str(root_dir),
+        PROTECTED_TERMS_KEY: existing_terms,
+        "added_terms": added_terms,
+        "removed_terms": [],
+        "protected_term_count": len(existing_terms),
+        "bm25_refreshed": True,
+        "manifest": manifest,
+    }
+
+
+def delete_protected_terms(root_dir: Path, kb_name: str, terms: Iterable[str]) -> dict:
+    config = load_kb_config(root_dir, kb_name)
+    requested_terms = normalize_protected_terms(terms)
+    requested_keys = {term.casefold() for term in requested_terms}
+    existing_terms = list(config.get(PROTECTED_TERMS_KEY, []))
+    updated_terms = [term for term in existing_terms if term.casefold() not in requested_keys]
+    removed_terms = [term for term in existing_terms if term.casefold() in requested_keys]
+    removed_keys = {term.casefold() for term in removed_terms}
+    missing_terms = [term for term in requested_terms if term.casefold() not in removed_keys]
+    config[PROTECTED_TERMS_KEY] = updated_terms
+    config["updated_at"] = now_iso()
+    paths = kb_paths(root_dir, kb_name)
+    write_kb_config(paths, config)
+    write_kb_protected_terms(paths, updated_terms)
+    manifest = refresh_keyword_assets(
+        root_dir,
+        kb_name,
+        config,
+        extra={
+            "protected_terms_updated": True,
+            "protected_terms_added": [],
+            "protected_terms_removed": removed_terms,
+        },
+    )
+    return {
+        "kb_name": kb_name,
+        "root_dir": str(root_dir),
+        PROTECTED_TERMS_KEY: updated_terms,
+        "added_terms": [],
+        "removed_terms": removed_terms,
+        "missing_terms": missing_terms,
+        "protected_term_count": len(updated_terms),
+        "bm25_refreshed": True,
+        "manifest": manifest,
+    }
 
 
 def vector_search(records: list[dict], index, query_vector, top_k: int) -> list[dict]:
@@ -874,15 +1062,17 @@ def recall_one_kb(
     retrieval_mode: str,
     query_vector=None,
     query_terms: Counter[str] | None = None,
+    config: dict | None = None,
 ) -> tuple[list[dict], list[dict], tuple[int, int]]:
     mode = normalize_retrieval_mode(retrieval_mode)
-    config, records, index, bm25_index = load_kb_bundle(
+    effective_config, records, index, bm25_index = load_kb_bundle(
         root_dir,
         kb_name,
         load_vector_index=mode in {"semantic", "hybrid"},
         load_bm25_index=mode in {"keyword", "hybrid"},
+        config=config,
     )
-    effective_topk, effective_topn = resolve_query_limits(config, topk, topn)
+    effective_topk, effective_topn = resolve_query_limits(effective_config, topk, topn)
     candidate_limit = recall_limit(effective_topk, rerank)
     semantic_candidates = []
     keyword_candidates = []
@@ -908,8 +1098,13 @@ def search_one_kb(
     retrieval_mode: str,
 ) -> list[dict]:
     mode = normalize_retrieval_mode(retrieval_mode)
+    config = load_kb_config(root_dir, kb_name)
     query_vector = prepare_query_vector(query) if mode in {"semantic", "hybrid"} else None
-    query_terms = prepare_keyword_query_terms(query) if mode in {"keyword", "hybrid"} else None
+    query_terms = (
+        prepare_keyword_query_terms(query, protected_terms=config.get(PROTECTED_TERMS_KEY, []))
+        if mode in {"keyword", "hybrid"}
+        else None
+    )
     semantic_candidates, keyword_candidates, (effective_topk, effective_topn) = recall_one_kb(
         root_dir,
         kb_name,
@@ -919,6 +1114,7 @@ def search_one_kb(
         retrieval_mode=mode,
         query_vector=query_vector,
         query_terms=query_terms,
+        config=config,
     )
     return finalize_results(
         query,
@@ -954,11 +1150,16 @@ def search_across_kbs(
     mode = normalize_retrieval_mode(retrieval_mode)
     effective_topk, effective_topn = resolve_query_limits(None, topk, topn)
     query_vector = prepare_query_vector(query) if mode in {"semantic", "hybrid"} else None
-    query_terms = prepare_keyword_query_terms(query) if mode in {"keyword", "hybrid"} else None
     semantic_candidates = []
     keyword_candidates = []
     for kb_name in list_kb_names(root_dir):
         try:
+            config = load_kb_config(root_dir, kb_name)
+            query_terms = (
+                prepare_keyword_query_terms(query, protected_terms=config.get(PROTECTED_TERMS_KEY, []))
+                if mode in {"keyword", "hybrid"}
+                else None
+            )
             kb_semantic, kb_keyword, _ = recall_one_kb(
                 root_dir,
                 kb_name,
@@ -968,6 +1169,7 @@ def search_across_kbs(
                 retrieval_mode=mode,
                 query_vector=query_vector,
                 query_terms=query_terms,
+                config=config,
             )
             semantic_candidates.extend(kb_semantic)
             keyword_candidates.extend(kb_keyword)
@@ -1083,6 +1285,16 @@ def parse_args() -> argparse.Namespace:
     delete.add_argument("--doc-id", required=True, help="Document directory name, e.g. {ts}-xx")
     delete.set_defaults(func=cmd_delete)
 
+    protect_add = subparsers.add_parser("protect-add", help="Add protected terms to one KB and refresh BM25 metadata.")
+    protect_add.add_argument("--kb", required=True, help="Knowledge-base name.")
+    protect_add.add_argument("--term", dest="terms", action="append", required=True, help="Protected term to add. Repeatable.")
+    protect_add.set_defaults(func=cmd_protect_add)
+
+    protect_delete = subparsers.add_parser("protect-delete", help="Delete protected terms from one KB and refresh BM25 metadata.")
+    protect_delete.add_argument("--kb", required=True, help="Knowledge-base name.")
+    protect_delete.add_argument("--term", dest="terms", action="append", required=True, help="Protected term to delete. Repeatable.")
+    protect_delete.set_defaults(func=cmd_protect_delete)
+
     query = subparsers.add_parser("query", help="Query one KB or all KBs and return Markdown.")
     query.add_argument("--kb", help="Knowledge-base name. Omit to search across all KBs.")
     query.add_argument("--query", required=True, help="Question text.")
@@ -1135,6 +1347,26 @@ def cmd_delete(args: argparse.Namespace) -> int:
         doc_id=args.doc_id,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_protect_add(args: argparse.Namespace) -> int:
+    result = add_protected_terms(
+        root_dir=Path(args.root_dir).expanduser(),
+        kb_name=args.kb,
+        terms=args.terms,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_protect_delete(args: argparse.Namespace) -> int:
+    result = delete_protected_terms(
+        root_dir=Path(args.root_dir).expanduser(),
+        kb_name=args.kb,
+        terms=args.terms,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 

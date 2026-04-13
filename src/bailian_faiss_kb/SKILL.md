@@ -14,6 +14,7 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"primaryEnv":"BAILIAN_SK"
 - 遍历某个知识库目录下的 `chunks/` 和 `t2q/` 建立或更新索引
 - 对整个知识库执行重建索引，同时重建语义与 BM25 工件
 - 在原始文档目录被删除后，从知识库级索引中移除对应数据
+- 对指定知识库增加或删除保护词，并离线刷新 BM25 工件
 - 对指定知识库做综合查询，默认同时使用语义与 BM25
 - 对指定知识库显式做语义查询
 - 对指定知识库显式做关键词查询
@@ -27,6 +28,7 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"primaryEnv":"BAILIAN_SK"
 - 向量模型固定为 `text-embedding-v4`
 - 向量维度固定为 `1024`
 - BM25 固定使用本地倒排索引和 `jieba` 分词
+- 每个知识库的保护词单独存放在 `/var/openclaw-kb/{kb}/protected_terms.json`
 - 可选重排模型固定为 `qwen3-rerank`
 - 查询默认模式固定为 `hybrid`
 - OpenClaw 必须先把原始文件抽取为文本，再进入这个 skill
@@ -59,6 +61,12 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"primaryEnv":"BAILIAN_SK"
 ## 路径最小约束
 
 知识库根目录默认是 `/var/openclaw-kb`，但可通过 `--root-dir` 覆盖。
+
+每个知识库目录下的保护词文件固定为：
+
+```text
+/var/openclaw-kb/{kb}/protected_terms.json
+```
 
 每次进入这个 skill 前，必须先算出这三个值：
 
@@ -165,6 +173,7 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py index \
 - 仅基于真实 `chunk` 构建 BM25 倒排索引并写入 `bm25.json`
 - 更新 `manifest.json`
 - 将 `topk` 与 `topN` 写入知识库配置
+- 构建 BM25 时读取当前知识库目录下的 `protected_terms.json`
 
 ### 6.1 重建知识库索引
 
@@ -188,6 +197,7 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py rebuild \
 - 重新写出完整的 `bm25.json`
 - 重新写出完整的 `manifest.json`
 - 这个入口用于“全量重建”，保证语义检索和关键词检索始终一起重建
+- 重建 BM25 时会读取当前知识库目录下的 `protected_terms.json`
 
 ### 7. 删除
 
@@ -214,6 +224,45 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py delete \
 ```text
 /var/openclaw-kb/regulation/{ts}-xx
 ```
+
+### 7.1 增加保护词
+
+这一步调用 Python。它会把保护词写入知识库目录下的 `protected_terms.json`，然后离线刷新 `bm25.json` 与 `manifest.json`。
+
+```bash
+python3 {baseDir}/scripts/bailian_faiss_kb.py protect-add \
+  --root-dir /var/openclaw-kb \
+  --kb regulation \
+  --term 测试环境权限 \
+  --term OpenClaw
+```
+
+行为：
+
+- 保护词写入 `/var/openclaw-kb/{kb}/protected_terms.json`
+- 仅更新当前知识库
+- 基于现有 `vectors.jsonl` 离线重建 `bm25.json`
+- 刷新 `manifest.json`
+- 不重建向量，不重写 `index.faiss`
+
+### 7.2 删除保护词
+
+这一步调用 Python。它会从知识库目录下的 `protected_terms.json` 删除指定词条，然后离线刷新 `bm25.json` 与 `manifest.json`。
+
+```bash
+python3 {baseDir}/scripts/bailian_faiss_kb.py protect-delete \
+  --root-dir /var/openclaw-kb \
+  --kb regulation \
+  --term 测试环境权限
+```
+
+行为：
+
+- 从 `/var/openclaw-kb/{kb}/protected_terms.json` 删除指定保护词
+- 仅更新当前知识库
+- 基于现有 `vectors.jsonl` 离线重建 `bm25.json`
+- 刷新 `manifest.json`
+- 不重建向量，不重写 `index.faiss`
 
 ### 8. 查询
 
@@ -278,6 +327,7 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py query \
 - `--retrieval-mode hybrid` 时，先分别做语义召回和 BM25 召回，再在真实 chunk 级别融合
 - 无 rerank 时，先做召回，再按 `topN` 返回
 - 有 rerank 时，先做召回与融合，再对真实 chunk 候选做 rerank，返回前 `topN`
+- 关键词查询分词会读取当前知识库目录下的 `protected_terms.json`
 
 ## 查询输出格式
 
@@ -319,4 +369,5 @@ python3 {baseDir}/scripts/bailian_faiss_kb.py doctor \
 - 如果某个 chunk 文件或 T2Q 文件命名不合法，Python 会拒绝索引
 - 如果 `summary.txt` 超过 200 字，Python 会拒绝索引
 - 如果要让新建或更新过的文档参与 BM25，必须重新执行 `index`
+- 如果只变更保护词，不需要重新做 embedding，可直接执行 `protect-add` 或 `protect-delete`
 - 需要更详细的实现说明时，读取 [references/runtime-notes.md](./references/runtime-notes.md)

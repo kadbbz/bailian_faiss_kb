@@ -8,6 +8,7 @@
 - 基于 `chunks/` 和 `t2q/` 建立或刷新知识库索引
 - 对整个知识库执行全量重建，同时重建语义与 BM25 索引
 - 在文档删除后从索引中移除对应记录
+- 为指定知识库增加或删除保护词，并离线刷新 BM25 索引
 - 对单个知识库或全部知识库执行综合、语义或关键词检索
 - 可选启用 `qwen3-rerank` 做结果重排
 
@@ -271,6 +272,14 @@ python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /tmp/openclaw
 /var/openclaw-kb/{kb}/{ts}-{safe_name}
 ```
 
+每个知识库目录下还会维护：
+
+```text
+/var/openclaw-kb/{kb}/protected_terms.json
+```
+
+这个文件保存该知识库自己的保护词列表。增加或删除保护词后，脚本会基于现有 `vectors.jsonl` 离线重建 `bm25.json`，同时刷新 `manifest.json`，不需要重新做 embedding。
+
 详细规则见：
 
 - `src/bailian_faiss_kb/references/layout.md`
@@ -292,6 +301,23 @@ python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw
 ```bash
 python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb rebuild \
   --kb regulation
+```
+
+为知识库增加保护词：
+
+```bash
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb protect-add \
+  --kb regulation \
+  --term 测试环境权限 \
+  --term OpenClaw
+```
+
+从知识库删除保护词：
+
+```bash
+python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw-kb protect-delete \
+  --kb regulation \
+  --term 测试环境权限
 ```
 
 查询单个知识库：
@@ -341,6 +367,14 @@ python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw
 - 网络访问仅限阿里云百炼的 HTTPS embedding 和 rerank 接口
 - 对外请求只会读取百炼 API Key，不会上传其他环境变量
 
+## 保护词说明
+
+- 保护词按知识库存放在 `/var/openclaw-kb/{kb}/protected_terms.json`
+- `protect-add` 和 `protect-delete` 只改当前知识库自己的保护词，不影响其他知识库
+- 保护词会同时作用于 BM25 建索引和关键词查询分词
+- 新增或删除保护词后，脚本会离线刷新当前知识库的 `bm25.json` 和 `manifest.json`
+- 语义检索、向量文件和 `index.faiss` 不会因为保护词变更而重建
+
 ## 发布说明
 
 - 根目录 `README.md` 作为维护版本
@@ -348,4 +382,4 @@ python src/bailian_faiss_kb/scripts/bailian_faiss_kb.py --root-dir /var/openclaw
 
 ## 许可证
 
-MIT，见 `LICENSE`。
+MIT
